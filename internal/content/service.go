@@ -10,19 +10,22 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
 
 // Service handles article, story, and content operations.
 type Service struct {
 	pool   *pgxpool.Pool
+	redis  *redis.Client
 	logger zerolog.Logger
 }
 
 // NewService creates a new content service.
-func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
+func NewService(pool *pgxpool.Pool, redis *redis.Client, logger zerolog.Logger) *Service {
 	return &Service{
 		pool:   pool,
+		redis:  redis,
 		logger: logger.With().Str("module", "content").Logger(),
 	}
 }
@@ -59,7 +62,9 @@ type Article struct {
 	UpdatedAt       time.Time        `json:"updated_at"`
 	AuthorName      string           `json:"author_name,omitempty"`
 	CategoryNames   []string         `json:"categories,omitempty"`
+	CategoryIDs     []int            `json:"category_ids,omitempty"`
 	TagNames        []string         `json:"tags,omitempty"`
+	TagIDs          []int            `json:"tag_ids,omitempty"`
 }
 
 // ArticleListItem is a lighter article representation for list views.
@@ -84,23 +89,31 @@ type ArticleListItem struct {
 	TagNames      []string   `json:"tags,omitempty"`
 }
 
-// Category represents a news category taxonomy.
+// Category represents a news category taxonomy in a hierarchical tree.
 type Category struct {
-	ID        int    `json:"id"`
-	TenantID  int    `json:"tenant_id"`
-	Name      string `json:"name"`
-	Slug      string `json:"slug"`
-	SortOrder int    `json:"sort_order"`
+	ID        int        `json:"id"`
+	TenantID  int        `json:"tenant_id,omitempty"`
+	ParentID  *int       `json:"parent_id,omitempty"`
+	Level     int        `json:"level"`
+	Name      string     `json:"name"`
+	Slug      string     `json:"slug"`
+	Icon      string     `json:"icon,omitempty"`
+	Path      string     `json:"path,omitempty"`
+	SortOrder int        `json:"sort_order"`
+	Children  []Category `json:"children,omitempty"`
 }
 
-// LiveBlogEntry represents an append-only live update.
+// LiveBlogEntry represents an append-only live update for elections, breaking events, and live coverage.
 type LiveBlogEntry struct {
-	ID        int64           `json:"id"`
-	ArticleID uuid.UUID       `json:"article_id"`
-	Body      json.RawMessage `json:"body"`
-	AuthorID  int64           `json:"author_id"`
-	IsPinned  bool            `json:"is_pinned"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID         int64           `json:"id"`
+	ArticleID  uuid.UUID       `json:"article_id"`
+	Headline   string          `json:"headline"`
+	Body       json.RawMessage `json:"body"`
+	AuthorID   int64           `json:"author_id"`
+	AuthorName string          `json:"author_name"`
+	IsPinned   bool            `json:"is_pinned"`
+	IsBreaking bool            `json:"is_breaking"`
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 // ArticleVersion represents edit history.
@@ -135,6 +148,9 @@ type CreateArticleInput struct {
 
 // CreateArticle creates a new article draft.
 func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, tenantID int, authorID int64, input CreateArticleInput) (*Article, error) {
+	if tenantID <= 0 {
+		tenantID = 1
+	}
 	slug := generateSlug(input.Title)
 
 	if input.Language == "" {
@@ -218,6 +234,84 @@ func (s *Service) GetArticle(ctx context.Context, tx pgx.Tx, articleID uuid.UUID
 		return nil, fmt.Errorf("get article: %w", err)
 	}
 
+	// Hydrate categories
+	catRows, _ := tx.Query(ctx, `
+		SELECT c.id, c.name 
+		FROM categories c 
+		JOIN article_categories ac ON ac.category_id = c.id 
+		WHERE ac.article_id = $1
+	`, articleID)
+	if catRows != nil {
+		for catRows.Next() {
+			var cid int
+			var cname string
+			if catRows.Scan(&cid, &cname) == nil {
+				a.CategoryIDs = append(a.CategoryIDs, cid)
+				a.CategoryNames = append(a.CategoryNames, cname)
+			}
+		}
+		catRows.Close()
+	}
+
+	return &a, nil
+}
+
+// UpdateArticle updates an existing article draft or published story.
+func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.UUID, editorID int64, input CreateArticleInput) (*Article, error) {
+	query := `
+		UPDATE articles SET
+			title = COALESCE(NULLIF($2, ''), title),
+			body = COALESCE(NULLIF($3, 'null'::jsonb), body),
+			excerpt = $4,
+			language = COALESCE(NULLIF($5, ''), language),
+			is_breaking = $6,
+			is_featured = $7,
+			is_national = $8,
+			meta_title = $9,
+			meta_description = $10,
+			featured_image = $11,
+			district_id = $12,
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, story_id, tenant_id, district_id, language, title, slug, body, excerpt,
+				  status, author_id, is_breaking, is_featured, is_national,
+				  meta_title, meta_description, featured_image,
+				  view_count, created_at, updated_at
+	`
+
+	var a Article
+	err := tx.QueryRow(ctx, query,
+		articleID, input.Title, input.Body, nilIfEmpty(input.Excerpt),
+		input.Language, input.IsBreaking, input.IsFeatured, input.IsNational,
+		input.MetaTitle, input.MetaDescription, input.FeaturedImage, input.DistrictID,
+	).Scan(
+		&a.ID, &a.StoryID, &a.TenantID, &a.DistrictID, &a.Language, &a.Title, &a.Slug, &a.Body, &a.Excerpt,
+		&a.Status, &a.AuthorID, &a.IsBreaking, &a.IsFeatured, &a.IsNational,
+		&a.MetaTitle, &a.MetaDescription, &a.FeaturedImage,
+		&a.ViewCount, &a.CreatedAt, &a.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("update article: %w", err)
+	}
+
+	// Sync categories with zero duplicates
+	if len(input.CategoryIDs) > 0 {
+		_, _ = tx.Exec(ctx, "DELETE FROM article_categories WHERE article_id = $1", a.ID)
+		seen := make(map[int]bool)
+		for _, catID := range input.CategoryIDs {
+			if catID > 0 && !seen[catID] {
+				seen[catID] = true
+				_, _ = tx.Exec(ctx, "INSERT INTO article_categories (article_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, catID)
+			}
+		}
+	}
+
+	// Record edit version diff
+	_, _ = tx.Exec(ctx, `
+		INSERT INTO article_versions (article_id, edited_by, diff, snapshot, version_num) 
+		VALUES ($1, $2, '{}', $3, (SELECT COALESCE(MAX(version_num), 0) + 1 FROM article_versions WHERE article_id = $1))
+	`, a.ID, editorID, input.Body)
+
 	return &a, nil
 }
 
@@ -260,6 +354,25 @@ func (s *Service) GetArticleBySlug(ctx context.Context, tx pgx.Tx, slug, languag
 		_, _ = s.pool.Exec(context.Background(), "UPDATE articles SET view_count = view_count + 1 WHERE id = $1", a.ID)
 	}()
 
+	// Hydrate categories
+	catRows, _ := tx.Query(ctx, `
+		SELECT c.id, c.name 
+		FROM categories c 
+		JOIN article_categories ac ON ac.category_id = c.id 
+		WHERE ac.article_id = $1
+	`, a.ID)
+	if catRows != nil {
+		for catRows.Next() {
+			var cid int
+			var cname string
+			if catRows.Scan(&cid, &cname) == nil {
+				a.CategoryIDs = append(a.CategoryIDs, cid)
+				a.CategoryNames = append(a.CategoryNames, cname)
+			}
+		}
+		catRows.Close()
+	}
+
 	return &a, nil
 }
 
@@ -289,7 +402,7 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 	if filter.Page < 1 {
 		filter.Page = 1
 	}
-	if filter.PerPage < 1 || filter.PerPage > 100 {
+	if filter.PerPage < 1 || filter.PerPage > 500 {
 		filter.PerPage = 20
 	}
 
@@ -297,7 +410,7 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 	args := []interface{}{}
 	argIdx := 1
 
-	if filter.Status != "" {
+	if filter.Status != "" && filter.Status != "all" {
 		conditions = append(conditions, fmt.Sprintf("a.status = $%d", argIdx))
 		args = append(args, filter.Status)
 		argIdx++
@@ -323,13 +436,17 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 		argIdx++
 	}
 
-	// Single or multi-category filtering
+	// Single or multi-category filtering with recursive hierarchy roll-up
 	if filter.Category != "" {
 		conditions = append(conditions, fmt.Sprintf(`
 			EXISTS (
+				WITH RECURSIVE cat_tree AS (
+					SELECT id FROM categories WHERE slug = $%d OR name ILIKE $%d
+					UNION ALL
+					SELECT c.id FROM categories c JOIN cat_tree ct ON c.parent_id = ct.id
+				)
 				SELECT 1 FROM article_categories ac
-				JOIN categories c ON c.id = ac.category_id
-				WHERE ac.article_id = a.id AND (c.slug = $%d OR c.name ILIKE $%d)
+				WHERE ac.article_id = a.id AND ac.category_id IN (SELECT id FROM cat_tree)
 			)
 		`, argIdx, argIdx))
 		args = append(args, filter.Category)
@@ -337,9 +454,13 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 	} else if len(filter.Categories) > 0 {
 		conditions = append(conditions, fmt.Sprintf(`
 			EXISTS (
+				WITH RECURSIVE cat_tree AS (
+					SELECT id FROM categories WHERE slug = ANY($%d) OR name = ANY($%d)
+					UNION ALL
+					SELECT c.id FROM categories c JOIN cat_tree ct ON c.parent_id = ct.id
+				)
 				SELECT 1 FROM article_categories ac
-				JOIN categories c ON c.id = ac.category_id
-				WHERE ac.article_id = a.id AND (c.slug = ANY($%d) OR c.name = ANY($%d))
+				WHERE ac.article_id = a.id AND ac.category_id IN (SELECT id FROM cat_tree)
 			)
 		`, argIdx, argIdx))
 		args = append(args, filter.Categories)
@@ -410,11 +531,7 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 		argIdx++
 	}
 
-	if filter.TenantID > 1 {
-		conditions = append(conditions, fmt.Sprintf("(a.tenant_id = $%d OR a.is_national = TRUE)", argIdx))
-		args = append(args, filter.TenantID)
-		argIdx++
-	}
+
 
 	where := strings.Join(conditions, " AND ")
 
@@ -482,10 +599,14 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 	return articles, total, rows.Err()
 }
 
-// ListCategories returns all categories available for a tenant.
+// ListCategories returns all categories in the master taxonomy.
 func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) ([]Category, error) {
-	query := `SELECT id, tenant_id, name, slug, sort_order FROM categories WHERE tenant_id = $1 ORDER BY sort_order, name`
-	rows, err := tx.Query(ctx, query, tenantID)
+	query := `
+		SELECT id, COALESCE(tenant_id, 1), parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+		FROM categories
+		ORDER BY level ASC, sort_order ASC, name ASC
+	`
+	rows, err := tx.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -494,7 +615,7 @@ func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) (
 	var list []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.Slug, &c.SortOrder); err != nil {
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
 			return nil, err
 		}
 		list = append(list, c)
@@ -502,14 +623,183 @@ func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) (
 	return list, rows.Err()
 }
 
+func (s *Service) ListCategoriesDirect(ctx context.Context, tenantID int) ([]Category, error) {
+	query := `
+		SELECT id, COALESCE(tenant_id, 1), parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+		FROM categories
+		ORDER BY level ASC, sort_order ASC, name ASC
+	`
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []Category
+	for rows.Next() {
+		var c Category
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
+			return nil, err
+		}
+		list = append(list, c)
+	}
+	return list, rows.Err()
+}
+
+// ListCategoriesTree builds and returns the full nested hierarchical taxonomy tree.
+func (s *Service) ListCategoriesTree(ctx context.Context, tx pgx.Tx) ([]Category, error) {
+	flat, err := s.ListCategories(ctx, tx, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	lookup := make(map[int]*Category)
+	for i := range flat {
+		flat[i].Children = []Category{}
+		lookup[flat[i].ID] = &flat[i]
+	}
+
+	var roots []Category
+	for i := range flat {
+		c := lookup[flat[i].ID]
+		if c.ParentID == nil || *c.ParentID == 0 {
+			roots = append(roots, *c)
+		} else if parent, exists := lookup[*c.ParentID]; exists {
+			parent.Children = append(parent.Children, *c)
+		}
+	}
+
+	for i := range roots {
+		if node, exists := lookup[roots[i].ID]; exists {
+			roots[i] = *node
+		}
+	}
+
+	return roots, nil
+}
+
+// CreateCategory creates a new category (supports parent_id, level, icon, path).
+func (s *Service) CreateCategory(ctx context.Context, tx pgx.Tx, tenantID int, name, slug string) (*Category, error) {
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+	}
+	var c Category
+	err := tx.QueryRow(ctx, `
+		INSERT INTO categories (tenant_id, name, slug, sort_order)
+		VALUES ($1, $2, $3, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories WHERE tenant_id = $1))
+		ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id, tenant_id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+	`, tenantID, name, slug).Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder)
+	if err != nil {
+		return nil, fmt.Errorf("create category: %w", err)
+	}
+	return &c, nil
+}
+
+// DeleteCategory removes a category by ID.
+func (s *Service) DeleteCategory(ctx context.Context, tx pgx.Tx, id int) error {
+	_, err := tx.Exec(ctx, "DELETE FROM categories WHERE id = $1", id)
+	return err
+}
+
+// Tag represents an article keyword tag.
+type Tag struct {
+	ID         int    `json:"id"`
+	TenantID   int    `json:"tenant_id"`
+	Name       string `json:"name"`
+	Slug       string `json:"slug"`
+	UsageCount int    `json:"usage_count,omitempty"`
+}
+
+// ListTags returns all tags for a tenant.
+func (s *Service) ListTags(ctx context.Context, tx pgx.Tx, tenantID int) ([]Tag, error) {
+	_, _ = tx.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+	query := `
+		SELECT t.id, COALESCE(t.tenant_id, 1), t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
+		FROM tags t
+		LEFT JOIN (
+			SELECT tag_id, COUNT(*) as cnt FROM article_tags GROUP BY tag_id
+		) at_cnt ON at_cnt.tag_id = t.id
+		ORDER BY usage_count DESC, t.name ASC
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []Tag
+	for rows.Next() {
+		var t Tag
+		if err := rows.Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
+			return nil, err
+		}
+		list = append(list, t)
+	}
+	return list, rows.Err()
+}
+
+func (s *Service) ListTagsDirect(ctx context.Context, tenantID int) ([]Tag, error) {
+	_, _ = s.pool.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+	query := `
+		SELECT t.id, COALESCE(t.tenant_id, 1), t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
+		FROM tags t
+		LEFT JOIN (
+			SELECT tag_id, COUNT(*) as cnt FROM article_tags GROUP BY tag_id
+		) at_cnt ON at_cnt.tag_id = t.id
+		ORDER BY usage_count DESC, t.name ASC
+	`
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []Tag
+	for rows.Next() {
+		var t Tag
+		if err := rows.Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
+			return nil, err
+		}
+		list = append(list, t)
+	}
+	return list, rows.Err()
+}
+
+// CreateTag creates a new tag.
+func (s *Service) CreateTag(ctx context.Context, tx pgx.Tx, tenantID int, name, slug string) (*Tag, error) {
+	_, _ = tx.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+	}
+	var t Tag
+	err := tx.QueryRow(ctx, `
+		INSERT INTO tags (name, slug, tenant_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id, COALESCE(tenant_id, 1), name, slug
+	`, name, slug, tenantID).Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug)
+	if err != nil {
+		return nil, fmt.Errorf("create tag: %w", err)
+	}
+	return &t, nil
+}
+
+// DeleteTag removes a tag by ID.
+func (s *Service) DeleteTag(ctx context.Context, tx pgx.Tx, id int) error {
+	_, err := tx.Exec(ctx, "DELETE FROM tags WHERE id = $1", id)
+	return err
+}
+
 // ─── Status Transitions ─────────────────────────
 
 var validTransitions = map[string][]string{
-	"draft":     {"review"},
-	"review":    {"approved", "draft"},
-	"approved":  {"published", "draft"},
-	"published": {"archived", "draft"},
-	"archived":  {"draft"},
+	"draft":     {"review", "approved", "scheduled", "published", "archived"},
+	"review":    {"approved", "draft", "scheduled", "published", "archived"},
+	"approved":  {"scheduled", "published", "review", "draft", "archived"},
+	"scheduled": {"published", "approved", "draft", "archived"},
+	"published": {"archived", "draft", "review"},
+	"archived":  {"draft", "published"},
 }
 
 // TransitionStatus changes an article's editorial status.
@@ -518,6 +808,11 @@ func (s *Service) TransitionStatus(ctx context.Context, tx pgx.Tx, articleID uui
 	err := tx.QueryRow(ctx, "SELECT status FROM articles WHERE id = $1", articleID).Scan(&currentStatus)
 	if err != nil {
 		return fmt.Errorf("fetch article status: %w", err)
+	}
+
+	// Idempotent: If already in target status, return success
+	if currentStatus == newStatus {
+		return nil
 	}
 
 	allowed, ok := validTransitions[currentStatus]
@@ -550,6 +845,11 @@ func (s *Service) TransitionStatus(ctx context.Context, tx pgx.Tx, articleID uui
 		args = append(args, userID)
 		argIdx++
 	}
+	if newStatus == "scheduled" {
+		updateQuery += fmt.Sprintf(", editor_id = $%d", argIdx)
+		args = append(args, userID)
+		argIdx++
+	}
 
 	updateQuery += fmt.Sprintf(" WHERE id = $%d", argIdx)
 	args = append(args, articleID)
@@ -562,6 +862,42 @@ func (s *Service) TransitionStatus(ctx context.Context, tx pgx.Tx, articleID uui
 	_, _ = tx.Exec(ctx,
 		`INSERT INTO article_versions (article_id, edited_by, diff) VALUES ($1, $2, $3)`,
 		articleID, userID, fmt.Sprintf(`{"transition":"%s->%s"}`, currentStatus, newStatus),
+	)
+
+	return nil
+}
+
+// ScheduleArticle validates a future timestamp and transitions article to scheduled status.
+func (s *Service) ScheduleArticle(ctx context.Context, tx pgx.Tx, articleID uuid.UUID, scheduledAt time.Time, userID int64) error {
+	if scheduledAt.Before(time.Now()) {
+		return fmt.Errorf("scheduled time must be in the future")
+	}
+
+	var currentStatus string
+	err := tx.QueryRow(ctx, "SELECT status FROM articles WHERE id = $1", articleID).Scan(&currentStatus)
+	if err != nil {
+		return fmt.Errorf("fetch article status: %w", err)
+	}
+
+	if currentStatus == "archived" {
+		return fmt.Errorf("cannot schedule an archived article")
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE articles
+		SET status = 'scheduled',
+		    scheduled_at = $1,
+		    editor_id = $2,
+		    updated_at = NOW()
+		WHERE id = $3
+	`, scheduledAt, userID, articleID)
+	if err != nil {
+		return fmt.Errorf("schedule article: %w", err)
+	}
+
+	_, _ = tx.Exec(ctx,
+		`INSERT INTO article_versions (article_id, edited_by, diff) VALUES ($1, $2, $3)`,
+		articleID, userID, fmt.Sprintf(`{"action":"scheduled","scheduled_at":"%s"}`, scheduledAt.Format(time.RFC3339)),
 	)
 
 	return nil
@@ -609,27 +945,100 @@ func (s *Service) GetStoryVariants(ctx context.Context, tx pgx.Tx, storyID uuid.
 
 // ─── Live Blog Entries ──────────────────────────
 
-func (s *Service) AddLiveBlogEntry(ctx context.Context, tx pgx.Tx, articleID uuid.UUID, authorID int64, body json.RawMessage, isPinned bool) (*LiveBlogEntry, error) {
+func (s *Service) AddLiveBlogEntry(ctx context.Context, tx pgx.Tx, articleID uuid.UUID, authorID int64, headline string, body json.RawMessage, isPinned, isBreaking bool) (*LiveBlogEntry, error) {
+	_, _ = tx.Exec(ctx, `
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS headline VARCHAR(255) DEFAULT '';
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_breaking BOOLEAN DEFAULT FALSE;
+	`)
+
+	if len(body) == 0 || !json.Valid(body) {
+		encoded, _ := json.Marshal(string(body))
+		body = encoded
+	}
+
 	query := `
-		INSERT INTO live_blog_entries (article_id, body, author_id, is_pinned)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, article_id, body, author_id, is_pinned, created_at
+		INSERT INTO live_blog_entries (article_id, headline, body, author_id, is_pinned, is_breaking)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, article_id, COALESCE(headline, ''), body, author_id, is_pinned, COALESCE(is_breaking, false), created_at
 	`
 	var e LiveBlogEntry
-	err := tx.QueryRow(ctx, query, articleID, body, authorID, isPinned).
-		Scan(&e.ID, &e.ArticleID, &e.Body, &e.AuthorID, &e.IsPinned, &e.CreatedAt)
+	err := tx.QueryRow(ctx, query, articleID, headline, body, authorID, isPinned, isBreaking).
+		Scan(&e.ID, &e.ArticleID, &e.Headline, &e.Body, &e.AuthorID, &e.IsPinned, &e.IsBreaking, &e.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("add live blog entry: %w", err)
 	}
+
+	_ = tx.QueryRow(ctx, "SELECT display_name FROM users WHERE id = $1", authorID).Scan(&e.AuthorName)
+	if e.AuthorName == "" {
+		e.AuthorName = "Editorial Desk"
+	}
+
+	if s.redis != nil {
+		if payload, err := json.Marshal(e); err == nil {
+			_ = s.redis.Publish(ctx, "stream:live_blog:"+articleID.String(), payload).Err()
+			if isBreaking {
+				_ = s.redis.Publish(ctx, "stream:breaking_news", payload).Err()
+			}
+		}
+	}
+
+	return &e, nil
+}
+
+func (s *Service) AddLiveBlogEntryDirect(ctx context.Context, articleID uuid.UUID, authorID int64, headline string, body json.RawMessage, isPinned, isBreaking bool) (*LiveBlogEntry, error) {
+	_, _ = s.pool.Exec(ctx, `
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS headline VARCHAR(255) DEFAULT '';
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_breaking BOOLEAN DEFAULT FALSE;
+	`)
+
+	if len(body) == 0 || !json.Valid(body) {
+		encoded, _ := json.Marshal(string(body))
+		body = encoded
+	}
+
+	query := `
+		INSERT INTO live_blog_entries (article_id, headline, body, author_id, is_pinned, is_breaking)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, article_id, COALESCE(headline, ''), body, author_id, is_pinned, COALESCE(is_breaking, false), created_at
+	`
+	var e LiveBlogEntry
+	err := s.pool.QueryRow(ctx, query, articleID, headline, body, authorID, isPinned, isBreaking).
+		Scan(&e.ID, &e.ArticleID, &e.Headline, &e.Body, &e.AuthorID, &e.IsPinned, &e.IsBreaking, &e.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("add live blog entry: %w", err)
+	}
+
+	_ = s.pool.QueryRow(ctx, "SELECT display_name FROM users WHERE id = $1", authorID).Scan(&e.AuthorName)
+	if e.AuthorName == "" {
+		e.AuthorName = "Editorial Desk"
+	}
+
+	if s.redis != nil {
+		if payload, err := json.Marshal(e); err == nil {
+			_ = s.redis.Publish(ctx, "stream:live_blog:"+articleID.String(), payload).Err()
+			if isBreaking {
+				_ = s.redis.Publish(ctx, "stream:breaking_news", payload).Err()
+			}
+		}
+	}
+
 	return &e, nil
 }
 
 func (s *Service) ListLiveBlogEntries(ctx context.Context, tx pgx.Tx, articleID uuid.UUID) ([]LiveBlogEntry, error) {
+	_, _ = tx.Exec(ctx, `
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS headline VARCHAR(255) DEFAULT '';
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_breaking BOOLEAN DEFAULT FALSE;
+	`)
+
 	query := `
-		SELECT id, article_id, body, author_id, is_pinned, created_at
-		FROM live_blog_entries
-		WHERE article_id = $1
-		ORDER BY is_pinned DESC, created_at DESC
+		SELECT lbe.id, lbe.article_id, COALESCE(lbe.headline, ''), lbe.body, lbe.author_id,
+		       COALESCE(u.display_name, 'Editorial Desk'),
+		       lbe.is_pinned, COALESCE(lbe.is_breaking, false), lbe.created_at
+		FROM live_blog_entries lbe
+		LEFT JOIN users u ON u.id = lbe.author_id
+		WHERE lbe.article_id = $1
+		ORDER BY lbe.is_pinned DESC, lbe.created_at DESC
 	`
 	rows, err := tx.Query(ctx, query, articleID)
 	if err != nil {
@@ -640,12 +1049,64 @@ func (s *Service) ListLiveBlogEntries(ctx context.Context, tx pgx.Tx, articleID 
 	var list []LiveBlogEntry
 	for rows.Next() {
 		var e LiveBlogEntry
-		if err := rows.Scan(&e.ID, &e.ArticleID, &e.Body, &e.AuthorID, &e.IsPinned, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.ArticleID, &e.Headline, &e.Body, &e.AuthorID, &e.AuthorName, &e.IsPinned, &e.IsBreaking, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		list = append(list, e)
 	}
 	return list, rows.Err()
+}
+
+func (s *Service) ListLiveBlogEntriesDirect(ctx context.Context, articleID uuid.UUID) ([]LiveBlogEntry, error) {
+	_, _ = s.pool.Exec(ctx, `
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS headline VARCHAR(255) DEFAULT '';
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_breaking BOOLEAN DEFAULT FALSE;
+	`)
+
+	query := `
+		SELECT lbe.id, lbe.article_id, COALESCE(lbe.headline, ''), lbe.body, lbe.author_id,
+		       COALESCE(u.display_name, 'Editorial Desk'),
+		       lbe.is_pinned, COALESCE(lbe.is_breaking, false), lbe.created_at
+		FROM live_blog_entries lbe
+		LEFT JOIN users u ON u.id = lbe.author_id
+		WHERE lbe.article_id = $1
+		ORDER BY lbe.is_pinned DESC, lbe.created_at DESC
+	`
+	rows, err := s.pool.Query(ctx, query, articleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []LiveBlogEntry
+	for rows.Next() {
+		var e LiveBlogEntry
+		if err := rows.Scan(&e.ID, &e.ArticleID, &e.Headline, &e.Body, &e.AuthorID, &e.AuthorName, &e.IsPinned, &e.IsBreaking, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, e)
+	}
+	return list, rows.Err()
+}
+
+func (s *Service) DeleteLiveBlogEntry(ctx context.Context, tx pgx.Tx, id int64) error {
+	var err error
+	if tx != nil {
+		_, err = tx.Exec(ctx, "DELETE FROM live_blog_entries WHERE id = $1", id)
+	} else {
+		_, err = s.pool.Exec(ctx, "DELETE FROM live_blog_entries WHERE id = $1", id)
+	}
+	return err
+}
+
+func (s *Service) TogglePinLiveBlogEntry(ctx context.Context, tx pgx.Tx, id int64, isPinned bool) error {
+	var err error
+	if tx != nil {
+		_, err = tx.Exec(ctx, "UPDATE live_blog_entries SET is_pinned = $1 WHERE id = $2", isPinned, id)
+	} else {
+		_, err = s.pool.Exec(ctx, "UPDATE live_blog_entries SET is_pinned = $1 WHERE id = $2", isPinned, id)
+	}
+	return err
 }
 
 // ─── Version History ────────────────────────────

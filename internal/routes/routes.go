@@ -1,10 +1,6 @@
 package routes
 
 import (
-	// Standard Library
-	"strconv"
-	"strings"
-
 	// Third-Party Core Frameworks
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,11 +23,11 @@ import (
 	"newsplatform/api/internal/poll"
 	"newsplatform/api/internal/stream"
 
-	// Internal Domain Handlers - Revenue, Discovery, Multi-Tenancy & Analytics
+	// Internal Domain Handlers - Revenue, Discovery, Settings & Analytics
 	"newsplatform/api/internal/ads"
 	"newsplatform/api/internal/analytics"
 	"newsplatform/api/internal/seo"
-	"newsplatform/api/internal/tenant"
+	"newsplatform/api/internal/settings"
 
 	// Shared Infrastructure & Middleware
 	"newsplatform/api/pkg/config"
@@ -58,12 +54,11 @@ type HandlerRegistry struct {
 	Stream     *stream.Handler
 	Notify     *notify.Handler
 
-	// Monetization, Discovery & Tenant Infrastructure
-	Ads           *ads.Handler
-	SEO           *seo.Handler
-	Analytics     *analytics.Handler
-	Tenant        *tenant.Handler
-	TenantService *tenant.Service
+	// Monetization, Discovery, Settings & Analytics
+	Ads       *ads.Handler
+	SEO       *seo.Handler
+	Analytics *analytics.Handler
+	Settings  *settings.Handler
 }
 
 // Setup builds and attaches all API route groups to Fiber.
@@ -82,84 +77,6 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 		return c.JSON(fiber.Map{"status": "ready", "database": "connected"})
 	})
 
-	// Indian ISO-3166-2 Region to State Edition Slug Mapping
-	indianRegionMap := map[string]string{
-		"MH": "maharashtra", "JH": "jharkhand", "DL": "delhi", "UP": "uttar-pradesh",
-		"WB": "west-bengal", "TN": "tamil-nadu", "KA": "karnataka", "GJ": "gujarat",
-		"RJ": "rajasthan", "PB": "punjab", "BR": "bihar", "MP": "madhya-pradesh",
-		"KL": "kerala", "AP": "andhra-pradesh", "TS": "telangana", "TG": "telangana",
-		"OR": "odisha", "OD": "odisha", "AS": "assam", "GA": "goa",
-		"HP": "himachal-pradesh", "UK": "uttarakhand", "UT": "uttarakhand",
-		"HR": "haryana", "JK": "jammu-kashmir", "CH": "chandigarh", "CT": "chhattisgarh",
-		"CG": "chhattisgarh", "TR": "tripura", "ML": "meghalaya", "MN": "manipur",
-		"NL": "nagaland", "MZ": "mizoram", "SK": "sikkim", "AR": "arunachal-pradesh",
-		"PY": "puducherry", "AN": "andaman-nicobar", "LA": "ladakh",
-	}
-
-	// Public Tenant Resolver (?state=maharashtra, Cloudflare CF-Region, header, or default national)
-	publicTenantResolver := func(c *fiber.Ctx) (int64, error) {
-		stateSlug := c.Query("state")
-		if stateSlug == "" {
-			stateSlug = c.Query("tenant")
-		}
-		if stateSlug == "" {
-			stateSlug = c.Query("edition")
-		}
-
-		// 1. Explicit query param (with regional aliases)
-		if stateSlug != "" {
-			normalizedSlug := strings.ToLower(strings.TrimSpace(stateSlug))
-			aliases := map[string]string{
-				"kolkata":      "west-bengal",
-				"calcutta":     "west-bengal",
-				"bengal":       "west-bengal",
-				"up":           "uttar-pradesh",
-				"orissa":       "odisha",
-				"odisa":        "odisha",
-				"ncr":          "delhi",
-				"new-delhi":    "delhi",
-				"cg":           "chhattisgarh",
-				"chhatisgarh":  "chhattisgarh",
-				"chhatishgar":  "chhattisgarh",
-				"jh":           "jharkhand",
-				"br":           "bihar",
-			}
-			if target, exists := aliases[normalizedSlug]; exists {
-				normalizedSlug = target
-			}
-
-			t, err := h.TenantService.GetTenantBySlug(c.Context(), normalizedSlug)
-			if err == nil && t != nil {
-				return int64(t.ID), nil
-			}
-		}
-
-		// 2. Custom header
-		if tid := c.Get("X-Tenant-ID"); tid != "" {
-			if id, err := strconv.ParseInt(tid, 10, 64); err == nil {
-				return id, nil
-			}
-		}
-
-		// 3. Hyperlocal Edge Geolocation (Cloudflare CF-Region-Code or CF-Region)
-		cfRegion := strings.ToUpper(strings.TrimSpace(c.Get("CF-Region-Code")))
-		if cfRegion == "" {
-			cfRegion = strings.ToUpper(strings.TrimSpace(c.Get("CF-Region")))
-		}
-		if cfRegion == "" {
-			cfRegion = strings.ToUpper(strings.TrimSpace(c.Get("X-Country-Region")))
-		}
-
-		if mappedSlug, ok := indianRegionMap[cfRegion]; ok {
-			t, err := h.TenantService.GetTenantBySlug(c.Context(), mappedSlug)
-			if err == nil && t != nil {
-				return int64(t.ID), nil
-			}
-		}
-
-		return 1, nil // Default National
-	}
-
 	api := app.Group("/api/v1")
 
 	// ─── 1. Public Authentication Routes ────────────
@@ -168,7 +85,7 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 	// ─── 2. Public Reader & Audience Routes ─────────
 	// Edge Caching: s-maxage=60s on Cloudflare/CDN edge, stale-while-revalidate=300s
 	publicRoutes := api.Group("",
-		middleware.TenantContextPublic(pool, publicTenantResolver),
+		middleware.PublicTransactionContext(pool),
 		middleware.EdgeCache(60, 300),
 		middleware.OptionalAuth(cfg.JWT),
 	)
@@ -181,18 +98,32 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 	h.EPaper.RegisterPublicRoutes(publicRoutes)
 	h.Stream.RegisterPublicRoutes(publicRoutes)
 
-	// Public Tenant / State editions list
-	api.Get("/tenants", func(c *fiber.Ctx) error {
-		tenants, err := h.TenantService.ListTenants(c.Context())
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to list tenants"})
-		}
-		return c.JSON(fiber.Map{"success": true, "data": tenants})
+	// Public Regional Bureaus list (uses master hierarchical taxonomy)
+	api.Get("/regions", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"success": true,
+			"data": []fiber.Map{
+				{"id": 1, "name": "National Desk", "slug": "national", "is_national": true},
+			},
+		})
 	})
+
+	// Public Menus route for dynamic navigation
+	api.Get("/menus", h.IAM.ListMenus)
+	api.Get("/iam/menus", h.IAM.ListMenus)
+
+	// Public Settings (Platform identity, social channels, maintenance status)
+	if h.Settings != nil {
+		h.Settings.RegisterPublicRoutes(api)
+	}
 
 	// ─── 3. Staff Studio Routes (Newsroom CMS) ──────
 	authRequired := api.Group("", middleware.RequireAuth(cfg.JWT))
-	staffRoutes := authRequired.Group("", middleware.RequireStaff(), middleware.TenantContext(pool))
+	staffRoutes := authRequired.Group("", middleware.RequireStaff(), middleware.TransactionContext(pool))
+
+	staffRoutes.Get("/menus", h.IAM.ListMenus)
+	staffRoutes.Get("/iam/menus", h.IAM.ListMenus)
+	h.IAM.RegisterRoutes(staffRoutes)
 
 	h.Content.RegisterStudioRoutes(staffRoutes)
 	h.Media.RegisterRoutes(staffRoutes)
@@ -203,12 +134,14 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 	// ─── 4. Admin & Governance Routes ───────────────
 	adminRoutes := staffRoutes.Group("/admin")
 	h.IAM.RegisterRoutes(adminRoutes)
-	h.Tenant.RegisterRoutes(adminRoutes)
 	h.Ads.RegisterRoutes(adminRoutes)
 	h.Moderation.RegisterAdminRoutes(adminRoutes)
 	h.Employee.RegisterAdminRoutes(adminRoutes)
 	h.Analytics.RegisterAdminRoutes(adminRoutes)
 	h.Notify.RegisterAdminRoutes(adminRoutes)
+	if h.Settings != nil {
+		h.Settings.RegisterAdminRoutes(adminRoutes)
+	}
 
 	// ─── 5. SEO Sitemaps & RSS Feeds ───────────────
 	h.SEO.RegisterPublicRoutes(app)

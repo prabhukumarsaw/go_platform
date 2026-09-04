@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Service implements the IAM permission engine.
+// Service implements the enterprise IAM permission engine.
 type Service struct {
 	repo   *Repository
 	pool   *pgxpool.Pool
@@ -30,7 +30,7 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 // CanRequest holds all the context needed for a permission check.
 type CanRequest struct {
 	UserID       int64
-	TenantID     int64
+	TenantID     int64 // retained for backward compatibility
 	Action       string
 	IsSuperAdmin bool
 	IPAddress    string
@@ -40,11 +40,10 @@ type CanRequest struct {
 }
 
 // Can evaluates whether the user is allowed to perform the given action.
-func (s *Service) Can(ctx context.Context, userID, tenantID int64, action string) (bool, error) {
+func (s *Service) Can(ctx context.Context, userID, _ int64, action string) (bool, error) {
 	return s.CanWithContext(ctx, CanRequest{
-		UserID:   userID,
-		TenantID: tenantID,
-		Action:   action,
+		UserID: userID,
+		Action: action,
 	})
 }
 
@@ -85,7 +84,7 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 	}
 
 	// Step 2-3: user permission overrides
-	override, err := s.repo.FindActiveOverride(ctx, tx, req.UserID, req.TenantID, req.Action)
+	override, err := s.repo.FindActiveOverride(ctx, tx, req.UserID, req.Action)
 	if err != nil {
 		return false, fmt.Errorf("check override: %w", err)
 	}
@@ -96,7 +95,7 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 			return false, nil
 		}
 
-		policies, err := s.repo.FindABACPolicies(ctx, tx, req.UserID, req.TenantID)
+		policies, err := s.repo.FindABACPolicies(ctx, tx, req.UserID)
 		if err != nil {
 			return false, fmt.Errorf("fetch ABAC policies for override: %w", err)
 		}
@@ -113,13 +112,13 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 	}
 
 	// Step 4: role-based grant
-	hasGrant, err := s.repo.HasRoleGrant(ctx, tx, req.UserID, req.TenantID, req.Action)
+	hasGrant, err := s.repo.HasRoleGrant(ctx, tx, req.UserID, req.Action)
 	if err != nil {
 		return false, fmt.Errorf("check role grant: %w", err)
 	}
 
 	if hasGrant {
-		policies, err := s.repo.FindABACPolicies(ctx, tx, req.UserID, req.TenantID)
+		policies, err := s.repo.FindABACPolicies(ctx, tx, req.UserID)
 		if err != nil {
 			return false, fmt.Errorf("fetch ABAC policies for role: %w", err)
 		}
@@ -142,11 +141,8 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 
 // audit writes a decision record to the permission audit log.
 func (s *Service) audit(ctx context.Context, tx pgx.Tx, req CanRequest, decision, reason string) {
-	tenantID := &req.TenantID
-
 	entry := AuditEntry{
 		UserID:     req.UserID,
-		TenantID:   tenantID,
 		ActionName: req.Action,
 		Decision:   decision,
 		Reason:     reason,
@@ -160,48 +156,168 @@ func (s *Service) audit(ctx context.Context, tx pgx.Tx, req CanRequest, decision
 	}
 }
 
-// ─── Admin Operations ───────────────────────────
+// ─── Role Governance Operations ─────────────────
 
-func (s *Service) ListRoles(ctx context.Context, tx pgx.Tx, tenantID int64) ([]Role, error) {
-	return s.repo.ListRoles(ctx, tx, tenantID)
+func (s *Service) ListRoles(ctx context.Context, tx pgx.Tx, _ ...int64) ([]Role, error) {
+	return s.repo.ListRoles(ctx, tx)
 }
 
-func (s *Service) CreateRole(ctx context.Context, tx pgx.Tx, tenantID int64, name, description string) (*Role, error) {
-	return s.repo.CreateRole(ctx, tx, tenantID, name, description)
+func (s *Service) ListRolesDirect(ctx context.Context, _ ...int64) ([]Role, error) {
+	return s.repo.ListRolesDirect(ctx)
 }
 
-func (s *Service) AssignRolePermissions(ctx context.Context, tx pgx.Tx, roleID int, tenantID int64, menuActionIDs []int) error {
-	return s.repo.AssignRolePermissions(ctx, tx, roleID, tenantID, menuActionIDs)
+func (s *Service) GetRole(ctx context.Context, tx pgx.Tx, roleID int) (*Role, error) {
+	return s.repo.GetRole(ctx, tx, roleID)
 }
 
-func (s *Service) AssignUserRole(ctx context.Context, tx pgx.Tx, userID int64, tenantID int64, roleID int, assignedBy int64) error {
-	return s.repo.AssignUserRole(ctx, tx, userID, tenantID, roleID, assignedBy)
+func (s *Service) CreateRole(ctx context.Context, tx pgx.Tx, _ int64, name, description string) (*Role, error) {
+	return s.repo.CreateRole(ctx, tx, name, description)
 }
+
+func (s *Service) UpdateRole(ctx context.Context, tx pgx.Tx, roleID int, name, description string) (*Role, error) {
+	return s.repo.UpdateRole(ctx, tx, roleID, name, description)
+}
+
+func (s *Service) DeleteRole(ctx context.Context, tx pgx.Tx, roleID int) error {
+	return s.repo.DeleteRole(ctx, tx, roleID)
+}
+
+func (s *Service) CloneRole(ctx context.Context, tx pgx.Tx, sourceRoleID int, newName, newDescription string) (*Role, error) {
+	return s.repo.CloneRole(ctx, tx, sourceRoleID, newName, newDescription)
+}
+
+func (s *Service) GetRolePermissionMatrix(ctx context.Context, tx pgx.Tx, roleID int, _ ...int64) ([]MenuMatrixItem, error) {
+	return s.repo.GetRolePermissionMatrix(ctx, tx, roleID)
+}
+
+func (s *Service) GetRolePermissionMatrixDirect(ctx context.Context, roleID int, _ ...int64) ([]MenuMatrixItem, error) {
+	return s.repo.GetRolePermissionMatrixDirect(ctx, roleID)
+}
+
+func (s *Service) AssignRolePermissions(ctx context.Context, tx pgx.Tx, roleID int, _ int64, menuActionIDs []int) error {
+	return s.repo.AssignRolePermissions(ctx, tx, roleID, menuActionIDs)
+}
+
+func (s *Service) AssignUserRole(ctx context.Context, tx pgx.Tx, userID int64, _ int64, roleID int, assignedBy int64) error {
+	return s.repo.AssignUserRole(ctx, tx, userID, roleID, assignedBy)
+}
+
+// ─── Category / Bureau Scopes ───────────────────
+
+func (s *Service) GetUserCategoryScopes(ctx context.Context, tx pgx.Tx, userID int64) ([]CategoryScope, error) {
+	return s.repo.GetUserCategoryScopes(ctx, tx, userID)
+}
+
+func (s *Service) AssignUserCategoryScopes(ctx context.Context, tx pgx.Tx, userID int64, categoryIDs []int, assignedBy int64) error {
+	return s.repo.AssignUserCategoryScopes(ctx, tx, userID, categoryIDs, assignedBy)
+}
+
+func (s *Service) GetUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID, _ int64) ([]int, error) {
+	return s.repo.GetUserDistrictScopes(ctx, tx, userID)
+}
+
+func (s *Service) AssignUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID, _ int64, districtIDs []int) error {
+	return s.repo.AssignUserDistrictScopes(ctx, tx, userID, districtIDs)
+}
+
+// ─── Effective Permissions ─────────────────────
+
+func (s *Service) GetUserEffectivePermissions(ctx context.Context, tx pgx.Tx, userID int64) (*EffectivePermissions, error) {
+	return s.repo.GetUserEffectivePermissions(ctx, tx, userID)
+}
+
+// ─── Menu & Action Exploration ──────────────────
 
 func (s *Service) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
 	return s.repo.ListMenus(ctx, tx)
+}
+
+func (s *Service) ListMenusDirect(ctx context.Context) ([]Menu, error) {
+	return s.repo.ListMenusDirect(ctx)
 }
 
 func (s *Service) ListMenuActions(ctx context.Context, tx pgx.Tx, menuID int) ([]MenuAction, error) {
 	return s.repo.ListMenuActions(ctx, tx, menuID)
 }
 
-func (s *Service) CreateOverride(ctx context.Context, tx pgx.Tx, userID, tenantID int64, menuActionID int, effect, reason string, validFrom, validUntil *time.Time, grantedBy int64) error {
-	return s.repo.CreateOverride(ctx, tx, userID, tenantID, menuActionID, effect, reason, validFrom, validUntil, grantedBy)
+// ─── Overrides & ABAC ───────────────────────────
+
+func (s *Service) CreateOverride(ctx context.Context, tx pgx.Tx, userID, _ int64, menuActionID int, effect, reason string, validFrom, validUntil *time.Time, grantedBy int64) error {
+	return s.repo.CreateOverride(ctx, tx, userID, menuActionID, effect, reason, validFrom, validUntil, grantedBy)
 }
 
-func (s *Service) CreateABACPolicy(ctx context.Context, tx pgx.Tx, userID, tenantID int64, attribute string, value json.RawMessage) error {
-	return s.repo.CreateABACPolicy(ctx, tx, userID, tenantID, attribute, value)
+func (s *Service) CreateABACPolicy(ctx context.Context, tx pgx.Tx, userID, _ int64, attribute string, value json.RawMessage) error {
+	return s.repo.CreateABACPolicy(ctx, tx, userID, attribute, value)
 }
 
 func (s *Service) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset int) ([]AuditEntry, int64, error) {
 	return s.repo.ListAuditLogs(ctx, tx, limit, offset)
 }
 
-func (s *Service) GetUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID, tenantID int64) ([]int, error) {
-	return s.repo.GetUserDistrictScopes(ctx, tx, userID, tenantID)
+// ─── Staff Governance ───────────────────────────
+
+func (s *Service) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search string) ([]StaffUserRoleSummary, error) {
+	return s.repo.ListStaffWithRoles(ctx, tx, search)
 }
 
-func (s *Service) AssignUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID, tenantID int64, districtIDs []int) error {
-	return s.repo.AssignUserDistrictScopes(ctx, tx, userID, tenantID, districtIDs)
+func (s *Service) ListStaffWithRolesDirect(ctx context.Context, search string) ([]StaffUserRoleSummary, error) {
+	return s.repo.ListStaffWithRolesDirect(ctx, search)
+}
+
+// ApplyRoleTemplate applies a pre-configured newsroom permission preset to a role.
+func (s *Service) ApplyRoleTemplate(ctx context.Context, tx pgx.Tx, roleID int, templateName string) error {
+	var actionIDs []int
+	var query string
+
+	switch templateName {
+	case "editor":
+		// Full editorial access
+		query = `
+			SELECT ma.id FROM menu_actions ma
+			JOIN menus m ON m.id = ma.menu_id
+			WHERE m.name IN ('dashboard', 'articles', 'categories', 'tags', 'media_library', 'live_blogs', 'web_stories', 'epaper', 'comments', 'analytics')
+		`
+	case "reporter":
+		// Draft, edit, view
+		query = `
+			SELECT ma.id FROM menu_actions ma
+			JOIN menus m ON m.id = ma.menu_id
+			WHERE (m.name = 'articles' AND ma.action IN ('VIEW', 'ADD', 'EDIT', 'view', 'create', 'edit'))
+			   OR (m.name = 'media_library' AND ma.action IN ('VIEW', 'ADD', 'view', 'create'))
+			   OR (m.name IN ('categories', 'tags', 'dashboard') AND ma.action IN ('VIEW', 'view'))
+		`
+	case "fact_checker":
+		// Review & verify
+		query = `
+			SELECT ma.id FROM menu_actions ma
+			JOIN menus m ON m.id = ma.menu_id
+			WHERE (m.name = 'articles' AND ma.action IN ('VIEW', 'EDIT', 'APPROVE', 'REJECT', 'view', 'edit'))
+			   OR (m.name IN ('categories', 'tags', 'dashboard') AND ma.action IN ('VIEW', 'view'))
+		`
+	case "moderator":
+		// Comment moderation
+		query = `
+			SELECT ma.id FROM menu_actions ma
+			JOIN menus m ON m.id = ma.menu_id
+			WHERE m.name = 'comments'
+			   OR (m.name = 'dashboard' AND ma.action IN ('VIEW', 'view'))
+		`
+	default:
+		return fmt.Errorf("unknown template preset: %s", templateName)
+	}
+
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err == nil {
+			actionIDs = append(actionIDs, id)
+		}
+	}
+
+	return s.AssignRolePermissions(ctx, tx, roleID, 1, actionIDs)
 }

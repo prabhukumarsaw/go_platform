@@ -24,6 +24,7 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 		m := router.Group(path)
 		m.Post("/upload", h.Upload)
 		m.Get("/", h.List)
+		m.Get("/folders", h.ListFolders)
 		m.Patch("/:id", h.UpdateMetadata)
 		m.Delete("/:id", h.Delete)
 	}
@@ -67,7 +68,7 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 	return response.Created(c, media)
 }
 
-// List returns media files with filtering by category, mimeType, and search.
+// List returns media files with filtering by category, folder, mimeType, and search.
 func (h *Handler) List(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 	sess := middleware.SessionFromCtx(c)
@@ -78,17 +79,28 @@ func (h *Handler) List(c *fiber.Ctx) error {
 	}
 
 	category := c.Query("category")
+	folder := c.Query("folder")
 	mimeType := c.Query("mime_type")
 	search := c.Query("search")
 	page := c.QueryInt("page", 1)
 	perPage := c.QueryInt("per_page", 20)
 
-	items, total, err := h.service.ListMedia(c.Context(), tx, tenantID, category, mimeType, search, page, perPage)
+	items, total, err := h.service.ListMedia(c.Context(), tx, tenantID, category, folder, mimeType, search, page, perPage)
 	if err != nil {
 		return response.InternalError(c, "Failed to list media: "+err.Error())
 	}
 
 	return response.Paginated(c, items, page, perPage, total)
+}
+
+// ListFolders returns all media folders and count of assets.
+func (h *Handler) ListFolders(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	folders, err := h.service.ListFolders(c.Context(), tx)
+	if err != nil {
+		return response.InternalError(c, "Failed to list media folders: "+err.Error())
+	}
+	return response.Success(c, folders)
 }
 
 // UpdateMetadata updates alt text, caption, category, and folder for a media item.

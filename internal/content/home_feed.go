@@ -58,13 +58,11 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 		TopAuthors:       []AuthorSpotlight{},
 	}
 
-	// 1. State info
-	var stateName, stateSlug string
-	_ = tx.QueryRow(ctx, "SELECT name, slug FROM tenants WHERE id = $1", tenantID).Scan(&stateName, &stateSlug)
+	// 1. National Desk Edition
 	resp.StateEdition = StateEditionInfo{
-		ID:   tenantID,
-		Name: stateName,
-		Slug: stateSlug,
+		ID:   1,
+		Name: "National Desk",
+		Slug: "national",
 	}
 
 	// 2. Navigation Categories
@@ -77,14 +75,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// Dynamic deduplication map
 	seen := make(map[string]bool)
-	getExcluded := func() []string {
-		var list []string
-		for id := range seen {
-			list = append(list, id)
-		}
-		return list
-	}
-	_ = getExcluded
 
 	// 3. Breaking News (limit 5)
 	breakingFilter := ListArticlesFilter{
@@ -147,7 +137,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 6. Latest Stream (limit 12) - Deduplicated
 	latestFilter := ListArticlesFilter{
-		TenantID: 1, // National/Global feed
+		TenantID: 1,
 		Language: language,
 		Status:   "published",
 		SortBy:   "latest",
@@ -165,7 +155,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 		}
 	}
 
-	// 7. Trending News (limit 6) - Deduplicated (Global / National trending rank)
+	// 7. Trending News (limit 5) - Deduplicated
 	trendingFilter := ListArticlesFilter{
 		TenantID: 1,
 		Language: language,
@@ -183,13 +173,12 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 				}
 			}
 		}
-		// If all were seen in earlier blocks, allow top trending stories
 		if len(resp.Trending) == 0 && len(items) > 0 {
-			resp.Trending = items[:min(len(items), 5)]
+			resp.Trending = items[:feedMin(len(items), 5)]
 		}
 	}
 
-	// 8. Recommendations / Similar news pool - Deduplicated
+	// 8. Recommendations - Deduplicated
 	recFilter := ListArticlesFilter{
 		TenantID: 1,
 		Language: language,
@@ -206,13 +195,12 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 				}
 			}
 		}
-		// If all were seen in earlier blocks, allow top recommendation stories
 		if len(resp.Recommendations) == 0 && len(items) > 0 {
-			resp.Recommendations = items[:min(len(items), 4)]
+			resp.Recommendations = items[:feedMin(len(items), 4)]
 		}
 	}
 
-	// 9. Key Dynamic Category Sections (politics, business, technology, sports, entertainment, health, crime)
+	// 9. Category Sections
 	targetCats := []string{"politics", "business", "technology", "sports", "entertainment", "health", "crime"}
 	for _, cat := range targetCats {
 		catFilter := ListArticlesFilter{
@@ -233,14 +221,13 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 				}
 			}
 		}
-		// If specific category has no distinct tags left, allow top items
 		if len(catArticles) == 0 && len(items) > 0 {
-			catArticles = items[:min(len(items), 3)]
+			catArticles = items[:feedMin(len(items), 3)]
 		}
 		resp.CategorySections[cat] = catArticles
 	}
 
-	// 10. Top Authors / Columnists
+	// 10. Top Authors
 	authorQuery := `
 		SELECT u.id, u.display_name, COALESCE(u.avatar_url, ''), COUNT(a.id) as story_count
 		FROM users u
@@ -261,7 +248,29 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 		}
 	}
 
-	// 11. Active Poll & E-Papers & Web Stories
+	// 11-13. Safe optional table loaders (polls, web_stories, epapers may not exist)
+	s.loadActivePoll(ctx, tx, resp)
+	s.loadWebStories(ctx, tx, resp)
+	s.loadEPapers(ctx, tx, resp)
+
+	return resp, nil
+}
+
+// GetHomeFeedDirect uses the connection pool directly (no transaction required).
+func (s *Service) GetHomeFeedDirect(ctx context.Context, tenantID int, language, districtSlug string) (*HomeFeedResponse, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	return s.GetHomeFeed(ctx, tx, tenantID, language, districtSlug)
+}
+
+// ─── Safe optional table loaders (recover from missing tables) ─────
+
+func (s *Service) loadActivePoll(ctx context.Context, tx pgx.Tx, resp *HomeFeedResponse) {
+	defer func() { recover() }()
 	pollQuery := `
 		SELECT id, question, total_votes
 		FROM polls
@@ -278,8 +287,10 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 			"total_votes": totalVotes,
 		}
 	}
+}
 
-	// Web stories query
+func (s *Service) loadWebStories(ctx context.Context, tx pgx.Tx, resp *HomeFeedResponse) {
+	defer func() { recover() }()
 	wsQuery := `
 		SELECT id, title, slug, cover_image, jsonb_array_length(slides) as slide_count
 		FROM web_stories
@@ -303,8 +314,10 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 			}
 		}
 	}
+}
 
-	// E-Papers query
+func (s *Service) loadEPapers(ctx context.Context, tx pgx.Tx, resp *HomeFeedResponse) {
+	defer func() { recover() }()
 	epQuery := `
 		SELECT id, title, edition_date, COALESCE(thumbnail_url, ''), page_count
 		FROM epapers
@@ -328,11 +341,9 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 			}
 		}
 	}
-
-	return resp, nil
 }
 
-func min(a, b int) int {
+func feedMin(a, b int) int {
 	if a < b {
 		return a
 	}

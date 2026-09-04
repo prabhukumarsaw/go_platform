@@ -25,17 +25,19 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*An
 	var overview AnalyticsOverview
 
 	// Aggregate counts
-	_ = tx.QueryRow(ctx, "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles WHERE (tenant_id = $1 OR $1 = 1)", tenantID).
+	_ = tx.QueryRow(ctx, "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles").
 		Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalViews, &overview.TotalBreaking)
 
 	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM newsletter_subscriptions WHERE is_active = TRUE").Scan(&overview.TotalSubscribers)
 
-	// State readership distribution
+	// Regional / Category readership distribution
 	stateQuery := `
-		SELECT t.id, t.name, COALESCE(SUM(a.view_count), 0) as views, COUNT(a.id) as articles
-		FROM tenants t
-		LEFT JOIN articles a ON a.tenant_id = t.id AND a.status = 'published'
-		GROUP BY t.id, t.name
+		SELECT c.id, c.name, COALESCE(SUM(a.view_count), 0) as views, COUNT(a.id) as articles
+		FROM categories c
+		LEFT JOIN article_categories ac ON ac.category_id = c.id
+		LEFT JOIN articles a ON a.id = ac.article_id AND a.status = 'published'
+		WHERE c.level = 1 OR c.parent_id IS NULL
+		GROUP BY c.id, c.name
 		ORDER BY views DESC
 		LIMIT 10
 	`
@@ -43,8 +45,8 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*An
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
-			var tr TenantReadership
-			if err := rows.Scan(&tr.TenantID, &tr.TenantName, &tr.Views, &tr.Articles); err == nil {
+			var tr RegionalReadership
+			if err := rows.Scan(&tr.RegionID, &tr.RegionName, &tr.Views, &tr.Articles); err == nil {
 				overview.StateDistribution = append(overview.StateDistribution, tr)
 			}
 		}
@@ -55,12 +57,11 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*An
 		SELECT c.name, COUNT(ac.article_id) as count
 		FROM categories c
 		LEFT JOIN article_categories ac ON ac.category_id = c.id
-		WHERE (c.tenant_id = $1 OR $1 = 1)
 		GROUP BY c.name
 		ORDER BY count DESC
 		LIMIT 8
 	`
-	cRows, err := tx.Query(ctx, catQuery, tenantID)
+	cRows, err := tx.Query(ctx, catQuery)
 	if err == nil {
 		defer cRows.Close()
 		for cRows.Next() {
@@ -73,13 +74,13 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*An
 
 	// Top trending articles
 	trendQuery := `
-		SELECT id::text, title, slug, view_count, language
+		SELECT id, title, slug, view_count, language
 		FROM articles
-		WHERE status = 'published' AND (tenant_id = $1 OR $1 = 1)
+		WHERE status = 'published'
 		ORDER BY view_count DESC, published_at DESC
 		LIMIT 5
 	`
-	tRows, err := tx.Query(ctx, trendQuery, tenantID)
+	tRows, err := tx.Query(ctx, trendQuery)
 	if err == nil {
 		defer tRows.Close()
 		for tRows.Next() {
@@ -95,14 +96,13 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*An
 
 func (s *Service) GetAuthorLeaderboard(ctx context.Context, tx pgx.Tx) ([]AuthorLeaderboard, error) {
 	query := `
-		SELECT u.id, u.display_name, COALESCE(t.name, 'National'),
+		SELECT u.id, u.display_name, 'National Newsroom Desk' as bureau_name,
 		       COALESCE(SUM(a.view_count), 0) as total_views,
 		       COUNT(a.id) as articles
 		FROM users u
 		JOIN articles a ON a.author_id = u.id AND a.status = 'published'
-		LEFT JOIN tenants t ON t.id = a.tenant_id
 		WHERE u.is_staff = TRUE
-		GROUP BY u.id, u.display_name, t.name
+		GROUP BY u.id, u.display_name
 		ORDER BY total_views DESC
 		LIMIT 15
 	`
@@ -116,7 +116,7 @@ func (s *Service) GetAuthorLeaderboard(ctx context.Context, tx pgx.Tx) ([]Author
 	var list []AuthorLeaderboard
 	for rows.Next() {
 		var al AuthorLeaderboard
-		if err := rows.Scan(&al.AuthorID, &al.DisplayName, &al.TenantName, &al.TotalViews, &al.Articles); err != nil {
+		if err := rows.Scan(&al.AuthorID, &al.DisplayName, &al.BureauName, &al.TotalViews, &al.Articles); err != nil {
 			return nil, err
 		}
 		list = append(list, al)

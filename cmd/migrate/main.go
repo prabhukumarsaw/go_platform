@@ -64,7 +64,7 @@ func main() {
 	_, _ = conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())`)
 
 	var tablesExist bool
-	_ = conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='tenants')`).Scan(&tablesExist)
+	_ = conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='categories')`).Scan(&tablesExist)
 	if tablesExist {
 		_, _ = conn.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ('001_tenants.up.sql'), ('002_users_auth.up.sql'), ('003_iam_rbac.up.sql'), ('004_content.up.sql'), ('005_rls_policies.up.sql'), ('006_ads_seo.up.sql') ON CONFLICT DO NOTHING`)
 	}
@@ -73,7 +73,7 @@ func main() {
 		var alreadyApplied bool
 		_ = conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)", filename).Scan(&alreadyApplied)
 
-		if alreadyApplied && filename != "007_seed_data.up.sql" {
+		if alreadyApplied {
 			log.Info().Str("file", filename).Msg("• Already applied, skipping")
 			continue
 		}
@@ -94,9 +94,9 @@ func main() {
 		log.Info().Str("file", filename).Msg("✓ Applied successfully")
 	}
 
-	// Verify table count and tenant count
-	var tenantCount int
-	_ = conn.QueryRow(ctx, "SELECT COUNT(*) FROM tenants").Scan(&tenantCount)
+	// Verify categories, users, roles count
+	var categoryCount int
+	_ = conn.QueryRow(ctx, "SELECT COUNT(*) FROM categories").Scan(&categoryCount)
 
 	var userCount int
 	_ = conn.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount)
@@ -105,7 +105,7 @@ func main() {
 	_ = conn.QueryRow(ctx, "SELECT COUNT(*) FROM roles").Scan(&roleCount)
 
 	log.Info().
-		Int("tenants", tenantCount).
+		Int("categories", categoryCount).
 		Int("users", userCount).
 		Int("roles", roleCount).
 		Msg("🎉 Database migrations and seeding completed successfully!")

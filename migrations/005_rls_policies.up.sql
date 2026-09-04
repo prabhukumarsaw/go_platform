@@ -29,14 +29,15 @@ CREATE POLICY tenant_isolation ON stories
     );
 
 -- ──────────────────────────────────────────────
--- CATEGORIES
+-- CATEGORIES (Global & Tenant Accessible)
 -- ──────────────────────────────────────────────
 ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categories FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON categories
     USING (
-        tenant_id = current_setting('app.tenant_id', true)::int
+        tenant_id = 1
+        OR tenant_id = current_setting('app.tenant_id', true)::int
         OR current_setting('app.is_super_admin', true)::boolean = true
     );
 

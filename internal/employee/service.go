@@ -24,13 +24,20 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 	}
 }
 
-func (s *Service) ListEmployees(ctx context.Context, tx pgx.Tx, tenantID int, department string) ([]Employee, error) {
-	return s.repo.ListEmployees(ctx, tx, tenantID, department)
+func (s *Service) ListEmployees(ctx context.Context, tx pgx.Tx, department, search string) ([]Employee, error) {
+	return s.repo.ListEmployees(ctx, tx, department, search)
+}
+
+func (s *Service) GetEmployeeByID(ctx context.Context, tx pgx.Tx, employeeID int64) (*Employee, error) {
+	return s.repo.GetEmployeeByID(ctx, tx, employeeID)
 }
 
 func (s *Service) OnboardEmployee(ctx context.Context, tx pgx.Tx, input OnboardEmployeeInput) (*Employee, error) {
-	if input.UserID <= 0 {
-		return nil, errors.BadRequest("Valid user_id is required", nil)
+	if input.UserID <= 0 && input.Email == "" {
+		return nil, errors.BadRequest("Valid user_id or email is required", nil)
+	}
+	if input.DisplayName == "" && input.UserID <= 0 {
+		return nil, errors.BadRequest("Full legal name is required", nil)
 	}
 	if input.EmployeeCode == "" {
 		return nil, errors.BadRequest("Employee code is required", nil)
@@ -49,4 +56,8 @@ func (s *Service) OnboardEmployee(ctx context.Context, tx pgx.Tx, input OnboardE
 
 func (s *Service) UpdateStatus(ctx context.Context, tx pgx.Tx, employeeID int64, isActive bool) error {
 	return s.repo.UpdateStatus(ctx, tx, employeeID, isActive)
+}
+
+func (s *Service) DeleteEmployee(ctx context.Context, tx pgx.Tx, employeeID int64) error {
+	return s.repo.Delete(ctx, tx, employeeID)
 }

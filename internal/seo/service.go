@@ -85,12 +85,12 @@ type URLSet struct {
 	URLs    []SitemapURL `xml:"url"`
 }
 
-// GenerateSitemapIndex creates the top-level sitemap index listing per-tenant sitemaps.
+// GenerateSitemapIndex creates the top-level sitemap index listing category and regional sitemaps.
 func (s *Service) GenerateSitemapIndex(ctx context.Context) ([]byte, error) {
-	query := `SELECT slug FROM tenants WHERE is_active = TRUE ORDER BY name`
+	query := `SELECT slug FROM categories WHERE is_active IS NOT FALSE ORDER BY sort_order ASC, name ASC`
 	rows, err := s.pool.Query(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("fetch tenants for sitemap: %w", err)
+		return nil, fmt.Errorf("fetch categories for sitemap: %w", err)
 	}
 	defer rows.Close()
 
@@ -105,7 +105,7 @@ func (s *Service) GenerateSitemapIndex(ctx context.Context) ([]byte, error) {
 			return nil, err
 		}
 		index.Sitemaps = append(index.Sitemaps, SitemapEntry{
-			Loc:     fmt.Sprintf("%s/sitemaps/%s.xml", s.baseURL, slug),
+			Loc:     fmt.Sprintf("%s/category/%s", s.baseURL, slug),
 			LastMod: now,
 		})
 	}
@@ -117,20 +117,21 @@ func (s *Service) GenerateSitemapIndex(ctx context.Context) ([]byte, error) {
 	return append([]byte(xml.Header), output...), nil
 }
 
-// GenerateTenantSitemap creates a sitemap for a specific tenant's published articles.
-func (s *Service) GenerateTenantSitemap(ctx context.Context, tenantSlug string) ([]byte, error) {
+// GenerateCategorySitemap creates a sitemap for a specific category or region's published articles.
+func (s *Service) GenerateCategorySitemap(ctx context.Context, categorySlug string) ([]byte, error) {
 	query := `
 		SELECT a.slug, a.language, a.updated_at, a.is_breaking
 		FROM articles a
-		JOIN tenants t ON t.id = a.tenant_id
-		WHERE t.slug = $1 AND a.status = 'published'
+		JOIN article_categories ac ON ac.article_id = a.id
+		JOIN categories c ON c.id = ac.category_id
+		WHERE c.slug = $1 AND a.status = 'published'
 		ORDER BY a.published_at DESC
 		LIMIT 50000
 	`
 
-	rows, err := s.pool.Query(ctx, query, tenantSlug)
+	rows, err := s.pool.Query(ctx, query, categorySlug)
 	if err != nil {
-		return nil, fmt.Errorf("fetch articles for sitemap: %w", err)
+		return nil, fmt.Errorf("fetch articles for category sitemap: %w", err)
 	}
 	defer rows.Close()
 
@@ -155,7 +156,7 @@ func (s *Service) GenerateTenantSitemap(ctx context.Context, tenantSlug string) 
 		}
 
 		urlset.URLs = append(urlset.URLs, SitemapURL{
-			Loc:        fmt.Sprintf("%s/%s/%s?lang=%s", s.baseURL, tenantSlug, slug, lang),
+			Loc:        fmt.Sprintf("%s/news/%s?lang=%s", s.baseURL, slug, lang),
 			LastMod:    updatedAt.Format("2006-01-02"),
 			ChangeFreq: changeFreq,
 			Priority:   priority,
@@ -164,7 +165,7 @@ func (s *Service) GenerateTenantSitemap(ctx context.Context, tenantSlug string) 
 
 	output, err := xml.MarshalIndent(urlset, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("marshal tenant sitemap: %w", err)
+		return nil, fmt.Errorf("marshal category sitemap: %w", err)
 	}
 	return append([]byte(xml.Header), output...), nil
 }
@@ -206,7 +207,7 @@ type LogoLD struct {
 }
 
 // BuildNewsArticleLD creates structured data for a published article.
-func (s *Service) BuildNewsArticleLD(title, description, image, authorName, language, slug, tenantSlug string, publishedAt, updatedAt *time.Time) NewsArticleLD {
+func (s *Service) BuildNewsArticleLD(title, description, image, authorName, language, slug, categorySlug string, publishedAt, updatedAt *time.Time) NewsArticleLD {
 	ld := NewsArticleLD{
 		Context:          "https://schema.org",
 		Type:             "NewsArticle",
@@ -214,8 +215,8 @@ func (s *Service) BuildNewsArticleLD(title, description, image, authorName, lang
 		Description:      description,
 		Image:            image,
 		Author:           AuthorLD{Type: "Person", Name: authorName},
-		Publisher:        PublisherLD{Type: "Organization", Name: "Hybrid News Platform"},
-		MainEntityOfPage: fmt.Sprintf("%s/%s/%s", s.baseURL, tenantSlug, slug),
+		Publisher:        PublisherLD{Type: "Organization", Name: "BharatVani News Platform"},
+		MainEntityOfPage: fmt.Sprintf("%s/news/%s", s.baseURL, slug),
 		InLanguage:       language,
 	}
 
@@ -255,18 +256,22 @@ type RSSItem struct {
 }
 
 // GenerateRSSFeed produces standard RSS 2.0 XML for Google News and syndication.
-func (s *Service) GenerateRSSFeed(ctx context.Context, tenantSlug string) ([]byte, error) {
+func (s *Service) GenerateRSSFeed(ctx context.Context, categorySlug string) ([]byte, error) {
 	query := `
-		SELECT a.title, a.slug, COALESCE(a.excerpt, ''), a.published_at, COALESCE(u.display_name, 'Editorial Team'), t.name
+		SELECT a.title, a.slug, COALESCE(a.excerpt, ''), a.published_at, COALESCE(u.display_name, 'Editorial Desk')
 		FROM articles a
-		JOIN tenants t ON t.id = a.tenant_id
 		LEFT JOIN users u ON u.id = a.author_id
-		WHERE a.status = 'published'
 	`
 	args := []interface{}{}
-	if tenantSlug != "" && tenantSlug != "all" {
-		query += ` AND (t.slug = $1 OR a.is_national = TRUE)`
-		args = append(args, tenantSlug)
+	if categorySlug != "" && categorySlug != "all" {
+		query += `
+			JOIN article_categories ac ON ac.article_id = a.id
+			JOIN categories c ON c.id = ac.category_id
+			WHERE a.status = 'published' AND c.slug = $1
+		`
+		args = append(args, categorySlug)
+	} else {
+		query += ` WHERE a.status = 'published'`
 	}
 	query += ` ORDER BY a.published_at DESC LIMIT 30`
 
@@ -277,12 +282,15 @@ func (s *Service) GenerateRSSFeed(ctx context.Context, tenantSlug string) ([]byt
 	defer rows.Close()
 
 	var items []RSSItem
-	channelTitle := "BharatVani News Platform"
+	channelTitle := "BharatVani National News Wire"
+	if categorySlug != "" && categorySlug != "all" {
+		channelTitle = fmt.Sprintf("BharatVani News - %s Desk", categorySlug)
+	}
 	for rows.Next() {
-		var title, slug, excerpt, author, tName string
+		var title, slug, excerpt, author string
 		var pubDate time.Time
-		if err := rows.Scan(&title, &slug, &excerpt, &pubDate, &author, &tName); err == nil {
-			link := fmt.Sprintf("%s/article/%s", s.baseURL, slug)
+		if err := rows.Scan(&title, &slug, &excerpt, &pubDate, &author); err == nil {
+			link := fmt.Sprintf("%s/news/%s", s.baseURL, slug)
 			items = append(items, RSSItem{
 				Title:       title,
 				Link:        link,
@@ -291,9 +299,6 @@ func (s *Service) GenerateRSSFeed(ctx context.Context, tenantSlug string) ([]byt
 				GUID:        link,
 				Author:      author,
 			})
-			if tenantSlug != "" {
-				channelTitle = fmt.Sprintf("BharatVani News - %s Edition", tName)
-			}
 		}
 	}
 

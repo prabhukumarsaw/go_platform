@@ -111,7 +111,7 @@ func Load() (*Config, error) {
 		Media: MediaConfig{
 			UploadDir:   getEnv("MEDIA_UPLOAD_DIR", "./uploads"),
 			MaxFileSize: getEnvInt64("MEDIA_MAX_FILE_SIZE", 20*1024*1024), // 20MB
-			BaseURL:     getEnv("MEDIA_BASE_URL", "http://localhost:8080/media"),
+			BaseURL:     getEnv("MEDIA_BASE_URL", "http://localhost:8080/uploads"),
 		},
 		GoogleOAuth: GoogleOAuthConfig{
 			ClientID:     getEnv("GOOGLE_CLIENT_ID", ""),

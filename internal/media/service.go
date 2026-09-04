@@ -60,6 +60,12 @@ type Media struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// FolderSummary represents a media folder and its file count.
+type FolderSummary struct {
+	Folder string `json:"folder"`
+	Count  int64  `json:"count"`
+}
+
 // ─── Upload ─────────────────────────────────────
 
 // UploadFile saves a file to local storage and records metadata in the database.
@@ -144,7 +150,7 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, tenantID int, uploa
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, query,
 		mediaID, tenantID, uploaderID, storedFilename, filename, mimeType,
-		category, folder, written, relativePath, width, height,
+		category, folder, written, filepath.ToSlash(relativePath), width, height,
 	).Scan(&createdAt)
 	if err != nil {
 		os.Remove(absolutePath) // Clean up on DB failure
@@ -212,8 +218,8 @@ func (s *Service) UploadAvatar(ctx context.Context, userID int64, filename strin
 
 // ─── List / Search / Filter ─────────────────────
 
-// ListMedia returns media files filtered by category, mimeType, and search query.
-func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, category string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
+// ListMedia returns media files filtered by category, folder, mimeType, and search query.
+func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, category string, folder string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -228,6 +234,12 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, catego
 	if category != "" && category != "all" {
 		whereClauses = append(whereClauses, fmt.Sprintf("category = $%d", argIdx))
 		args = append(args, category)
+		argIdx++
+	}
+
+	if folder != "" && folder != "all" {
+		whereClauses = append(whereClauses, fmt.Sprintf("folder = $%d", argIdx))
+		args = append(args, folder)
 		argIdx++
 	}
 
@@ -286,6 +298,40 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, catego
 	}
 
 	return items, total, nil
+}
+
+// ListFolders aggregates all distinct media folders and returns their item counts.
+func (s *Service) ListFolders(ctx context.Context, tx pgx.Tx) ([]FolderSummary, error) {
+	query := `
+		SELECT COALESCE(NULLIF(folder, ''), 'general') AS folder_name, COUNT(*) AS total
+		FROM media
+		GROUP BY 1
+		ORDER BY total DESC, folder_name ASC
+	`
+	var rows pgx.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.Query(ctx, query)
+	} else {
+		rows, err = s.pool.Query(ctx, query)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var folders []FolderSummary
+	for rows.Next() {
+		var f FolderSummary
+		if err := rows.Scan(&f.Folder, &f.Count); err != nil {
+			return nil, err
+		}
+		folders = append(folders, f)
+	}
+	if folders == nil {
+		folders = []FolderSummary{}
+	}
+	return folders, rows.Err()
 }
 
 // UpdateMediaMetadata updates alt_text, caption, category, and folder for a media asset.

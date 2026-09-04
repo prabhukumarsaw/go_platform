@@ -2,7 +2,6 @@ package jobs
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -78,7 +77,7 @@ func (s *Scheduler) publishScheduledArticles(ctx context.Context) error {
 	query := `
 		UPDATE articles
 		SET status = 'published', published_at = NOW(), updated_at = NOW()
-		WHERE status IN ('draft', 'approved')
+		WHERE status IN ('scheduled', 'approved', 'draft')
 		  AND scheduled_at IS NOT NULL
 		  AND scheduled_at <= NOW()
 	`
@@ -99,7 +98,7 @@ func (s *Scheduler) recalculateTrending(ctx context.Context) error {
 	}
 
 	query := `
-		SELECT id, tenant_id, view_count
+		SELECT id, COALESCE(tenant_id, 1), view_count
 		FROM articles
 		WHERE status = 'published' AND published_at > NOW() - INTERVAL '7 days'
 		ORDER BY view_count DESC
@@ -121,12 +120,17 @@ func (s *Scheduler) recalculateTrending(ctx context.Context) error {
 			return err
 		}
 
-		key := fmt.Sprintf("trending:tenant:%d", tenantID)
-		pipe.ZAdd(ctx, key, redis.Z{
+		pipe.ZAdd(ctx, "trending:national", redis.Z{
 			Score:  float64(viewCount),
 			Member: id,
 		})
-		pipe.Expire(ctx, key, 10*time.Minute)
+		pipe.Expire(ctx, "trending:national", 10*time.Minute)
+
+		pipe.ZAdd(ctx, "trending:tenant:1", redis.Z{
+			Score:  float64(viewCount),
+			Member: id,
+		})
+		pipe.Expire(ctx, "trending:tenant:1", 10*time.Minute)
 	}
 
 	_, err = pipe.Exec(ctx)

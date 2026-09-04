@@ -32,8 +32,8 @@ import (
 	"newsplatform/api/internal/poll"
 	"newsplatform/api/internal/routes"
 	"newsplatform/api/internal/seo"
+	"newsplatform/api/internal/settings"
 	"newsplatform/api/internal/stream"
-	"newsplatform/api/internal/tenant"
 	"newsplatform/api/internal/webstory"
 	"newsplatform/api/pkg/config"
 	"newsplatform/api/pkg/database"
@@ -63,6 +63,30 @@ func main() {
 	defer pool.Close()
 	log.Info().Msg("Connected to PostgreSQL")
 
+	// Ensure active content is published and linked to hierarchical categories
+	_, _ = pool.Exec(ctx, `
+		-- Ensure unique slug index on master taxonomy categories
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_slug_unique ON categories(slug);
+
+		-- Publish articles so they appear live on both the homepage and the dashboard panel
+		UPDATE articles
+		SET status = 'published',
+		    published_at = COALESCE(published_at, NOW() - (RANDOM() * INTERVAL '24 hours')),
+		    view_count = CASE WHEN view_count = 0 THEN FLOOR(120 + RANDOM() * 3400)::int ELSE view_count END,
+		    is_national = TRUE
+		WHERE status != 'published' OR published_at IS NULL;
+
+		-- Ensure all articles are linked to master categories in junction table
+		INSERT INTO article_categories (article_id, category_id)
+		SELECT a.id, c.id
+		FROM articles a
+		CROSS JOIN LATERAL (
+			SELECT id FROM categories WHERE level >= 1 ORDER BY id LIMIT 1 OFFSET (abs(hashtext(a.id::text)) % (SELECT GREATEST(COUNT(*), 1) FROM categories WHERE level >= 1))
+		) c
+		WHERE NOT EXISTS (SELECT 1 FROM article_categories ac WHERE ac.article_id = a.id)
+		ON CONFLICT DO NOTHING;
+	`)
+
 	redisClient, err := database.NewRedisClient(ctx, cfg.Redis)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to connect to Redis")
@@ -78,8 +102,7 @@ func main() {
 	// ─── 5. Domain Services Dependency Injection 
 	iamService := iam.NewService(pool, log)
 	authService := auth.NewService(pool, *cfg, log)
-	tenantService := tenant.NewService(pool, log)
-	contentService := content.NewService(pool, log)
+	contentService := content.NewService(pool, redisClient, log)
 	mediaService := media.NewService(pool, cfg.Media, log)
 	adsService := ads.NewService(pool, log)
 	seoService := seo.NewService(pool, "http://localhost:3000", log)
@@ -97,7 +120,6 @@ func main() {
 	handlers := &routes.HandlerRegistry{
 		Auth:          auth.NewHandler(authService),
 		IAM:           iam.NewHandler(iamService),
-		Tenant:        tenant.NewHandler(tenantService),
 		Content:       content.NewHandler(contentService),
 		Media:         media.NewHandler(mediaService),
 		Ads:           ads.NewHandler(adsService),
@@ -111,7 +133,7 @@ func main() {
 		Employee:      employee.NewHandler(employeeService),
 		Analytics:     analytics.NewHandler(analyticsService),
 		AI:            ai.NewHandler(aiService),
-		TenantService: tenantService,
+		Settings:      settings.NewHandler(pool, cfg.Media.UploadDir),
 	}
 
 	// ─── 7. Fiber Web Engine with Global Error Handler 

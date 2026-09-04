@@ -39,21 +39,14 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 
 func (s *Service) ListEPapers(ctx context.Context, tx pgx.Tx, tenantID int, districtID *int, dateStr string) ([]EPaper, error) {
 	query := `
-		SELECT e.id, e.tenant_id, e.district_id, COALESCE(d.name, '') as district_name,
+		SELECT e.id, COALESCE(e.tenant_id, 1), e.district_id, '' as district_name,
 		       to_char(e.edition_date, 'YYYY-MM-DD') as edition_date,
 		       e.title, e.pdf_url, COALESCE(e.thumbnail_url, ''), e.page_count, e.is_active, e.created_at
 		FROM epapers e
-		LEFT JOIN districts d ON d.id = e.district_id
-		WHERE (e.tenant_id = $1 OR $1 = 1) AND e.is_active = TRUE
+		WHERE e.is_active = TRUE
 	`
-	args := []interface{}{tenantID}
-	argIdx := 2
-
-	if districtID != nil {
-		query += fmt.Sprintf(" AND e.district_id = $%d", argIdx)
-		args = append(args, *districtID)
-		argIdx++
-	}
+	var args []interface{}
+	argIdx := 1
 
 	if dateStr != "" {
 		query += fmt.Sprintf(" AND e.edition_date = $%d::date", argIdx)

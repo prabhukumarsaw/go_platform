@@ -5,7 +5,7 @@ import (
 	"newsplatform/api/pkg/response"
 )
 
-// Handler exposes HTTP endpoints for SEO and Sitemaps.
+// Handler exposes HTTP endpoints for SEO, Sitemaps, and RSS Feeds.
 type Handler struct {
 	service *Service
 }
@@ -19,12 +19,12 @@ func NewHandler(service *Service) *Handler {
 func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 	router.Get("/sitemap.xml", h.GetSitemapIndex)
 	router.Get("/sitemap-news.xml", h.GetGoogleNewsSitemap)
-	router.Get("/sitemaps/:tenantSlug.xml", h.GetTenantSitemap)
+	router.Get("/sitemaps/:categorySlug.xml", h.GetCategorySitemap)
 	router.Get("/feed/rss.xml", h.GetGlobalRSSFeed)
-	router.Get("/feed/:tenantSlug/rss.xml", h.GetTenantRSSFeed)
+	router.Get("/feed/:categorySlug/rss.xml", h.GetCategoryRSSFeed)
 }
 
-// GetGoogleNewsSitemap returns the Google News XML sitemap for last 48 hours.
+// GetGoogleNewsSitemap returns the Google News XML sitemap for the last 48 hours.
 func (h *Handler) GetGoogleNewsSitemap(c *fiber.Ctx) error {
 	xmlData, err := h.service.GenerateGoogleNewsSitemap(c.Context())
 	if err != nil {
@@ -46,23 +46,23 @@ func (h *Handler) GetSitemapIndex(c *fiber.Ctx) error {
 	return c.Send(xmlData)
 }
 
-// GetTenantSitemap returns a sitemap XML for a specific state edition/tenant.
-func (h *Handler) GetTenantSitemap(c *fiber.Ctx) error {
-	tenantSlug := c.Params("tenantSlug")
-	if tenantSlug == "" {
-		return response.BadRequest(c, "Tenant slug is required")
+// GetCategorySitemap returns a sitemap XML for a specific category or regional desk.
+func (h *Handler) GetCategorySitemap(c *fiber.Ctx) error {
+	categorySlug := c.Params("categorySlug")
+	if categorySlug == "" {
+		return response.BadRequest(c, "Category slug is required")
 	}
 
-	xmlData, err := h.service.GenerateTenantSitemap(c.Context(), tenantSlug)
+	xmlData, err := h.service.GenerateCategorySitemap(c.Context(), categorySlug)
 	if err != nil {
-		return response.InternalError(c, "Failed to generate tenant sitemap")
+		return response.InternalError(c, "Failed to generate category sitemap")
 	}
 
 	c.Set("Content-Type", "application/xml; charset=utf-8")
 	return c.Send(xmlData)
 }
 
-// GetGlobalRSSFeed produces standard RSS 2.0 XML across all state editions.
+// GetGlobalRSSFeed produces standard RSS 2.0 XML across all published stories.
 func (h *Handler) GetGlobalRSSFeed(c *fiber.Ctx) error {
 	xmlData, err := h.service.GenerateRSSFeed(c.Context(), "")
 	if err != nil {
@@ -73,12 +73,12 @@ func (h *Handler) GetGlobalRSSFeed(c *fiber.Ctx) error {
 	return c.Send(xmlData)
 }
 
-// GetTenantRSSFeed produces RSS 2.0 XML for a specific state edition.
-func (h *Handler) GetTenantRSSFeed(c *fiber.Ctx) error {
-	tenantSlug := c.Params("tenantSlug")
-	xmlData, err := h.service.GenerateRSSFeed(c.Context(), tenantSlug)
+// GetCategoryRSSFeed produces RSS 2.0 XML for a specific category or region.
+func (h *Handler) GetCategoryRSSFeed(c *fiber.Ctx) error {
+	categorySlug := c.Params("categorySlug")
+	xmlData, err := h.service.GenerateRSSFeed(c.Context(), categorySlug)
 	if err != nil {
-		return response.InternalError(c, "Failed to generate state RSS feed")
+		return response.InternalError(c, "Failed to generate category RSS feed")
 	}
 
 	c.Set("Content-Type", "application/rss+xml; charset=utf-8")

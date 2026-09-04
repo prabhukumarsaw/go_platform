@@ -1,7 +1,9 @@
 package content
 
 import (
+	"encoding/json"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -33,6 +35,8 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 
 	// Public taxonomy, search, live blogs, feed & home aggregator
 	router.Get("/categories", h.ListCategories)
+	router.Get("/categories/tree", h.ListCategoriesTree)
+	router.Get("/tags", h.ListTags)
 	router.Get("/search", h.Search)
 	router.Get("/home", h.GetHomeFeed)
 	router.Get("/feed/home", h.GetHomeFeed)
@@ -47,12 +51,23 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 	studio.Get("/", h.StudioListArticles)
 	studio.Post("/", h.CreateArticle)
 	studio.Get("/:id", h.GetArticle)
+	studio.Put("/:id", h.UpdateArticle)
+	studio.Patch("/:id", h.UpdateArticle)
 	studio.Post("/:id/transition", h.TransitionStatus)
+	studio.Post("/:id/schedule", h.ScheduleArticle)
 	studio.Get("/:id/versions", h.GetArticleVersions)
+
+	// Studio Taxonomy CRUD
+	router.Post("/studio/categories", h.CreateCategory)
+	router.Delete("/studio/categories/:id", h.DeleteCategory)
+	router.Post("/studio/tags", h.CreateTag)
+	router.Delete("/studio/tags/:id", h.DeleteTag)
 
 	// Studio Stories & Live blogs
 	router.Post("/studio/stories", h.CreateStory)
 	router.Post("/studio/live-blogs/:id/entries", h.AddLiveBlogEntry)
+	router.Delete("/studio/live-blogs/entries/:id", h.DeleteLiveBlogEntry)
+	router.Patch("/studio/live-blogs/entries/:id/pin", h.TogglePinLiveBlogEntry)
 }
 
 // ─── Public Handlers ────────────────────────────
@@ -197,20 +212,66 @@ func (h *Handler) GetArticleBySlug(c *fiber.Ctx) error {
 
 // ListCategories returns available categories for the active tenant.
 func (h *Handler) ListCategories(c *fiber.Ctx) error {
-	tx := c.Locals("tx").(pgx.Tx)
 	sess := middleware.SessionFromCtx(c)
-
 	tenantID := 1
 	if sess != nil && sess.ActiveTenantID > 0 {
 		tenantID = int(sess.ActiveTenantID)
+	} else if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
+		tenantID = int(tid)
 	}
 
-	categories, err := h.service.ListCategories(c.Context(), tx, tenantID)
+	var categories []Category
+	var err error
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		categories, err = h.service.ListCategories(c.Context(), tx, tenantID)
+	} else {
+		categories, err = h.service.ListCategoriesDirect(c.Context(), tenantID)
+	}
+
 	if err != nil {
 		return response.InternalError(c, "Failed to list categories: "+err.Error())
 	}
 
 	return response.Success(c, categories)
+}
+
+// ListCategoriesTree returns categories formatted as a hierarchical parent-child tree.
+func (h *Handler) ListCategoriesTree(c *fiber.Ctx) error {
+	var roots []Category
+	var err error
+
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		roots, err = h.service.ListCategoriesTree(c.Context(), tx)
+	} else {
+		flat, dErr := h.service.ListCategoriesDirect(c.Context(), 1)
+		if dErr != nil {
+			return response.InternalError(c, "Failed to list categories: "+dErr.Error())
+		}
+		lookup := make(map[int]*Category)
+		for i := range flat {
+			flat[i].Children = []Category{}
+			lookup[flat[i].ID] = &flat[i]
+		}
+		for i := range flat {
+			node := lookup[flat[i].ID]
+			if node.ParentID == nil || *node.ParentID == 0 {
+				roots = append(roots, *node)
+			} else if p, exists := lookup[*node.ParentID]; exists {
+				p.Children = append(p.Children, *node)
+			}
+		}
+		for i := range roots {
+			if n, exists := lookup[roots[i].ID]; exists {
+				roots[i] = *n
+			}
+		}
+	}
+
+	if err != nil {
+		return response.InternalError(c, "Failed to list category tree: "+err.Error())
+	}
+
+	return response.Success(c, roots)
 }
 
 // Search performs full-text search.
@@ -236,8 +297,6 @@ func (h *Handler) Search(c *fiber.Ctx) error {
 
 // GetHomeFeed aggregates all essential home blocks in a single, fast response.
 func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
-	tx := c.Locals("tx").(pgx.Tx)
-
 	tenantID := 1
 	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
 		tenantID = int(tid)
@@ -248,11 +307,19 @@ func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
 	language := c.Query("language", "en")
 	districtSlug := c.Query("district")
 
-	homeData, err := h.service.GetHomeFeed(c.Context(), tx, tenantID, language, districtSlug)
+	var homeData *HomeFeedResponse
+	var err error
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		homeData, err = h.service.GetHomeFeed(c.Context(), tx, tenantID, language, districtSlug)
+	} else {
+		homeData, err = h.service.GetHomeFeedDirect(c.Context(), tenantID, language, districtSlug)
+	}
 	if err != nil {
 		return response.InternalError(c, "Failed to load home feed: "+err.Error())
 	}
 
+	// Cache hint for CDN / reverse proxies
+	c.Set("Cache-Control", "public, max-age=30, stale-while-revalidate=60")
 	return response.Success(c, homeData)
 }
 
@@ -287,8 +354,13 @@ func (h *Handler) GetPersonalizedFeed(c *fiber.Ctx) error {
 func (h *Handler) StudioListArticles(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 
+	status := c.Query("status")
+	if status == "all" {
+		status = ""
+	}
+
 	filter := ListArticlesFilter{
-		Status:   c.Query("status"),
+		Status:   status,
 		Language: c.Query("language"),
 		Category: c.Query("category"),
 		Page:     c.QueryInt("page", 1),
@@ -340,6 +412,34 @@ func (h *Handler) GetArticle(c *fiber.Ctx) error {
 	return response.Success(c, article)
 }
 
+// UpdateArticle updates an existing article.
+func (h *Handler) UpdateArticle(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
+	tx := c.Locals("tx").(pgx.Tx)
+
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid article ID format")
+	}
+
+	var input CreateArticleInput
+	if err := c.BodyParser(&input); err != nil {
+		return response.BadRequest(c, "Invalid article payload")
+	}
+
+	editorID := int64(1)
+	if sess != nil && sess.UserID > 0 {
+		editorID = sess.UserID
+	}
+
+	article, err := h.service.UpdateArticle(c.Context(), tx, id, editorID, input)
+	if err != nil {
+		return response.InternalError(c, "Failed to update article: "+err.Error())
+	}
+
+	return response.Success(c, article)
+}
+
 // TransitionStatus transitions article status in the editorial workflow.
 func (h *Handler) TransitionStatus(c *fiber.Ctx) error {
 	sess := middleware.SessionFromCtx(c)
@@ -364,6 +464,39 @@ func (h *Handler) TransitionStatus(c *fiber.Ctx) error {
 	return response.Success(c, fiber.Map{
 		"message": "Article status transitioned successfully",
 		"status":  body.Status,
+	})
+}
+
+// ScheduleArticle schedules an article to be published at a specified timestamp.
+func (h *Handler) ScheduleArticle(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
+	tx := c.Locals("tx").(pgx.Tx)
+
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid article ID format")
+	}
+
+	var body struct {
+		ScheduledAt string `json:"scheduled_at"`
+	}
+	if err := c.BodyParser(&body); err != nil || body.ScheduledAt == "" {
+		return response.BadRequest(c, "scheduled_at timestamp is required")
+	}
+
+	scheduledTime, err := time.Parse(time.RFC3339, body.ScheduledAt)
+	if err != nil {
+		return response.BadRequest(c, "Invalid scheduled_at format (expected RFC3339, e.g. 2026-09-03T18:00:00Z)")
+	}
+
+	if err := h.service.ScheduleArticle(c.Context(), tx, id, scheduledTime, sess.UserID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.Success(c, fiber.Map{
+		"message":      "Article scheduled successfully",
+		"status":       "scheduled",
+		"scheduled_at": scheduledTime,
 	})
 }
 
@@ -419,7 +552,7 @@ func (h *Handler) GetStoryVariants(c *fiber.Ctx) error {
 
 func (h *Handler) AddLiveBlogEntry(c *fiber.Ctx) error {
 	sess := middleware.SessionFromCtx(c)
-	tx := c.Locals("tx").(pgx.Tx)
+	tx, _ := c.Locals("tx").(pgx.Tx)
 
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -427,14 +560,32 @@ func (h *Handler) AddLiveBlogEntry(c *fiber.Ctx) error {
 	}
 
 	var body struct {
-		Body     string `json:"body"`
-		IsPinned bool   `json:"is_pinned"`
+		Headline   string `json:"headline"`
+		Body       string `json:"body"`
+		IsPinned   bool   `json:"is_pinned"`
+		IsBreaking bool   `json:"is_breaking"`
 	}
-	if err := c.BodyParser(&body); err != nil || body.Body == "" {
+	if err := c.BodyParser(&body); err != nil || strings.TrimSpace(body.Body) == "" {
 		return response.BadRequest(c, "Entry body is required")
 	}
 
-	entry, err := h.service.AddLiveBlogEntry(c.Context(), tx, id, sess.UserID, []byte(body.Body), body.IsPinned)
+	// Correctly encode string as JSON bytes so Postgres JSONB does not fail with syntax error
+	jsonBody, err := json.Marshal(body.Body)
+	if err != nil {
+		jsonBody = []byte(`""`)
+	}
+
+	authorID := int64(1)
+	if sess != nil && sess.UserID > 0 {
+		authorID = sess.UserID
+	}
+
+	var entry *LiveBlogEntry
+	if tx != nil {
+		entry, err = h.service.AddLiveBlogEntry(c.Context(), tx, id, authorID, body.Headline, jsonBody, body.IsPinned, body.IsBreaking)
+	} else {
+		entry, err = h.service.AddLiveBlogEntryDirect(c.Context(), id, authorID, body.Headline, jsonBody, body.IsPinned, body.IsBreaking)
+	}
 	if err != nil {
 		return response.InternalError(c, "Failed to add live blog entry: "+err.Error())
 	}
@@ -443,16 +594,153 @@ func (h *Handler) AddLiveBlogEntry(c *fiber.Ctx) error {
 }
 
 func (h *Handler) ListLiveBlogEntries(c *fiber.Ctx) error {
-	tx := c.Locals("tx").(pgx.Tx)
 	id, err := uuid.Parse(c.Params("articleId"))
 	if err != nil {
 		return response.BadRequest(c, "Invalid article ID format")
 	}
 
-	entries, err := h.service.ListLiveBlogEntries(c.Context(), tx, id)
+	var entries []LiveBlogEntry
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		entries, err = h.service.ListLiveBlogEntries(c.Context(), tx, id)
+	} else {
+		entries, err = h.service.ListLiveBlogEntriesDirect(c.Context(), id)
+	}
 	if err != nil {
 		return response.InternalError(c, "Failed to list live blog entries: "+err.Error())
 	}
 
 	return response.Success(c, entries)
+}
+
+func (h *Handler) DeleteLiveBlogEntry(c *fiber.Ctx) error {
+	tx, _ := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return response.BadRequest(c, "Invalid live blog entry ID")
+	}
+
+	if err := h.service.DeleteLiveBlogEntry(c.Context(), tx, id); err != nil {
+		return response.InternalError(c, "Failed to delete live blog entry: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"deleted": true})
+}
+
+func (h *Handler) TogglePinLiveBlogEntry(c *fiber.Ctx) error {
+	tx, _ := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return response.BadRequest(c, "Invalid live blog entry ID")
+	}
+
+	var body struct {
+		IsPinned bool `json:"is_pinned"`
+	}
+	_ = c.BodyParser(&body)
+
+	if err := h.service.TogglePinLiveBlogEntry(c.Context(), tx, id, body.IsPinned); err != nil {
+		return response.InternalError(c, "Failed to update pin status: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"updated": true})
+}
+
+// ─── Taxonomy Handlers ──────────────────────────
+
+func (h *Handler) CreateCategory(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	tenantID := 1
+	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
+		tenantID = int(tid)
+	}
+
+	var body struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if err := c.BodyParser(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		return response.BadRequest(c, "Category name is required")
+	}
+
+	cat, err := h.service.CreateCategory(c.Context(), tx, tenantID, strings.TrimSpace(body.Name), strings.TrimSpace(body.Slug))
+	if err != nil {
+		return response.InternalError(c, "Failed to create category: "+err.Error())
+	}
+
+	return response.Created(c, cat)
+}
+
+func (h *Handler) DeleteCategory(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid category ID")
+	}
+
+	if err := h.service.DeleteCategory(c.Context(), tx, id); err != nil {
+		return response.InternalError(c, "Failed to delete category: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"deleted": true})
+}
+
+func (h *Handler) ListTags(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
+	tenantID := 1
+	if sess != nil && sess.ActiveTenantID > 0 {
+		tenantID = int(sess.ActiveTenantID)
+	} else if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
+		tenantID = int(tid)
+	}
+
+	var tags []Tag
+	var err error
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		tags, err = h.service.ListTags(c.Context(), tx, tenantID)
+	} else {
+		tags, err = h.service.ListTagsDirect(c.Context(), tenantID)
+	}
+
+	if err != nil {
+		return response.InternalError(c, "Failed to list tags: "+err.Error())
+	}
+
+	return response.Success(c, tags)
+}
+
+func (h *Handler) CreateTag(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	tenantID := 1
+	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
+		tenantID = int(tid)
+	}
+
+	var body struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if err := c.BodyParser(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		return response.BadRequest(c, "Tag name is required")
+	}
+
+	t, err := h.service.CreateTag(c.Context(), tx, tenantID, strings.TrimSpace(body.Name), strings.TrimSpace(body.Slug))
+	if err != nil {
+		return response.InternalError(c, "Failed to create tag: "+err.Error())
+	}
+
+	return response.Created(c, t)
+}
+
+func (h *Handler) DeleteTag(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid tag ID")
+	}
+
+	if err := h.service.DeleteTag(c.Context(), tx, id); err != nil {
+		return response.InternalError(c, "Failed to delete tag: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"deleted": true})
 }

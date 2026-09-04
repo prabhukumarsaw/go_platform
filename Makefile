@@ -3,6 +3,7 @@
 # ─── Development ─────────────────────────
 dev:
 	go run ./cmd/api
+	go run ./cmd/migrate
 
 build:
 	go build -o bin/api ./cmd/api
