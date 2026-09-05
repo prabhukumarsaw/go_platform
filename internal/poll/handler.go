@@ -23,16 +23,9 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 
 func (h *Handler) GetActivePoll(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
-
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
-
 	language := c.Query("language", "hi")
 
-	poll, err := h.service.GetActivePoll(c.Context(), tx, tenantID, language)
+	poll, err := h.service.GetActivePoll(c.Context(), tx, language)
 	if err != nil {
 		return response.InternalError(c, "Failed to get active poll: "+err.Error())
 	}

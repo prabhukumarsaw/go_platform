@@ -35,14 +35,13 @@ func NewService(pool *pgxpool.Pool, redis *redis.Client, logger zerolog.Logger) 
 // Article represents a full article with metadata.
 type Article struct {
 	ID              uuid.UUID        `json:"id"`
-	StoryID         *uuid.UUID       `json:"story_id,omitempty"`
-	TenantID        int              `json:"tenant_id"`
+	StoryID         *string          `json:"story_id,omitempty"`
 	DistrictID      *int             `json:"district_id,omitempty"`
 	DistrictName    string           `json:"district_name,omitempty"`
 	Language        string           `json:"language"`
 	Title           string           `json:"title"`
 	Slug            string           `json:"slug"`
-	Body            json.RawMessage  `json:"body"`
+	Body            string           `json:"body"`
 	Excerpt         *string          `json:"excerpt,omitempty"`
 	Status          string           `json:"status"`
 	AuthorID        int64            `json:"author_id"`
@@ -92,7 +91,6 @@ type ArticleListItem struct {
 // Category represents a news category taxonomy in a hierarchical tree.
 type Category struct {
 	ID        int        `json:"id"`
-	TenantID  int        `json:"tenant_id,omitempty"`
 	ParentID  *int       `json:"parent_id,omitempty"`
 	Level     int        `json:"level"`
 	Name      string     `json:"name"`
@@ -147,23 +145,20 @@ type CreateArticleInput struct {
 // ─── Article CRUD ───────────────────────────────
 
 // CreateArticle creates a new article draft.
-func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, tenantID int, authorID int64, input CreateArticleInput) (*Article, error) {
-	if tenantID <= 0 {
-		tenantID = 1
-	}
+func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, authorID int64, input CreateArticleInput) (*Article, error) {
 	slug := generateSlug(input.Title)
 
 	if input.Language == "" {
-		input.Language = "en"
+		input.Language = "hi"
 	}
 
 	query := `
 		INSERT INTO articles
-			(story_id, tenant_id, district_id, language, title, slug, body, excerpt,
+			(story_id, district_id, language, title, slug, body, excerpt,
 			 status, author_id, is_breaking, is_featured, is_national,
 			 meta_title, meta_description, featured_image)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'draft', $9, $10, $11, $12, $13, $14, $15)
-		RETURNING id, story_id, tenant_id, district_id, language, title, slug, body, excerpt,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8, $9, $10, $11, $12, $13, $14)
+		RETURNING id, story_id, district_id, language, title, slug, body, excerpt,
 				  status, author_id, is_breaking, is_featured, is_national,
 				  meta_title, meta_description, featured_image,
 				  view_count, created_at, updated_at
@@ -171,11 +166,11 @@ func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, tenantID int, au
 
 	var a Article
 	err := tx.QueryRow(ctx, query,
-		input.StoryID, tenantID, input.DistrictID, input.Language, input.Title, slug, input.Body, nilIfEmpty(input.Excerpt),
+		input.StoryID, input.DistrictID, input.Language, input.Title, slug, input.Body, nilIfEmpty(input.Excerpt),
 		authorID, input.IsBreaking, input.IsFeatured, input.IsNational,
 		input.MetaTitle, input.MetaDescription, input.FeaturedImage,
 	).Scan(
-		&a.ID, &a.StoryID, &a.TenantID, &a.DistrictID, &a.Language, &a.Title, &a.Slug, &a.Body, &a.Excerpt,
+		&a.ID, &a.StoryID, &a.DistrictID, &a.Language, &a.Title, &a.Slug, &a.Body, &a.Excerpt,
 		&a.Status, &a.AuthorID, &a.IsBreaking, &a.IsFeatured, &a.IsNational,
 		&a.MetaTitle, &a.MetaDescription, &a.FeaturedImage,
 		&a.ViewCount, &a.CreatedAt, &a.UpdatedAt,
@@ -203,7 +198,7 @@ func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, tenantID int, au
 // GetArticle retrieves a single article by ID.
 func (s *Service) GetArticle(ctx context.Context, tx pgx.Tx, articleID uuid.UUID) (*Article, error) {
 	query := `
-		SELECT a.id, a.story_id, a.tenant_id, a.district_id, a.language,
+		SELECT a.id, a.story_id, a.district_id, a.language,
 			   a.title, a.slug, a.body, a.excerpt, a.status,
 			   a.author_id, a.editor_id, a.reviewer_id,
 			   a.is_breaking, a.is_featured, a.is_national,
@@ -218,7 +213,7 @@ func (s *Service) GetArticle(ctx context.Context, tx pgx.Tx, articleID uuid.UUID
 
 	var a Article
 	err := tx.QueryRow(ctx, query, articleID).Scan(
-		&a.ID, &a.StoryID, &a.TenantID, &a.DistrictID, &a.Language,
+		&a.ID, &a.StoryID, &a.DistrictID, &a.Language,
 		&a.Title, &a.Slug, &a.Body, &a.Excerpt, &a.Status,
 		&a.AuthorID, &a.EditorID, &a.ReviewerID,
 		&a.IsBreaking, &a.IsFeatured, &a.IsNational,
@@ -273,7 +268,7 @@ func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.U
 			district_id = $12,
 			updated_at = NOW()
 		WHERE id = $1
-		RETURNING id, story_id, tenant_id, district_id, language, title, slug, body, excerpt,
+		RETURNING id, story_id, district_id, language, title, slug, body, excerpt,
 				  status, author_id, is_breaking, is_featured, is_national,
 				  meta_title, meta_description, featured_image,
 				  view_count, created_at, updated_at
@@ -285,7 +280,7 @@ func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.U
 		input.Language, input.IsBreaking, input.IsFeatured, input.IsNational,
 		input.MetaTitle, input.MetaDescription, input.FeaturedImage, input.DistrictID,
 	).Scan(
-		&a.ID, &a.StoryID, &a.TenantID, &a.DistrictID, &a.Language, &a.Title, &a.Slug, &a.Body, &a.Excerpt,
+		&a.ID, &a.StoryID, &a.DistrictID, &a.Language, &a.Title, &a.Slug, &a.Body, &a.Excerpt,
 		&a.Status, &a.AuthorID, &a.IsBreaking, &a.IsFeatured, &a.IsNational,
 		&a.MetaTitle, &a.MetaDescription, &a.FeaturedImage,
 		&a.ViewCount, &a.CreatedAt, &a.UpdatedAt,
@@ -318,7 +313,7 @@ func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.U
 // GetArticleBySlug retrieves a published article by slug (for reader).
 func (s *Service) GetArticleBySlug(ctx context.Context, tx pgx.Tx, slug, language string) (*Article, error) {
 	query := `
-		SELECT a.id, a.story_id, a.tenant_id, a.district_id, a.language,
+		SELECT a.id, a.story_id, a.district_id, a.language,
 			   a.title, a.slug, a.body, a.excerpt, a.status,
 			   a.author_id, a.editor_id, a.reviewer_id,
 			   a.is_breaking, a.is_featured, a.is_national,
@@ -328,12 +323,12 @@ func (s *Service) GetArticleBySlug(ctx context.Context, tx pgx.Tx, slug, languag
 			   COALESCE(u.display_name, '') as author_name
 		FROM articles a
 		LEFT JOIN users u ON u.id = a.author_id
-		WHERE a.slug = $1 AND a.language = $2 AND a.status = 'published'
+		WHERE a.slug = $1 AND a.status = 'published'
 	`
 
 	var a Article
-	err := tx.QueryRow(ctx, query, slug, language).Scan(
-		&a.ID, &a.StoryID, &a.TenantID, &a.DistrictID, &a.Language,
+	err := tx.QueryRow(ctx, query, slug).Scan(
+		&a.ID, &a.StoryID, &a.DistrictID, &a.Language,
 		&a.Title, &a.Slug, &a.Body, &a.Excerpt, &a.Status,
 		&a.AuthorID, &a.EditorID, &a.ReviewerID,
 		&a.IsBreaking, &a.IsFeatured, &a.IsNational,
@@ -378,7 +373,6 @@ func (s *Service) GetArticleBySlug(ctx context.Context, tx pgx.Tx, slug, languag
 
 // ListArticlesFilter options with full filter matrix.
 type ListArticlesFilter struct {
-	TenantID     int         `query:"tenant_id"`
 	Status       string      `query:"status"`
 	Language     string      `query:"language"`
 	Category     string      `query:"category"`
@@ -541,11 +535,8 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 		return nil, 0, fmt.Errorf("count articles: %w", err)
 	}
 
-	// Ordering logic (prioritizes local state dispatches first, then national news)
+	// Ordering logic
 	orderBy := "a.published_at DESC NULLS LAST"
-	if filter.TenantID > 1 {
-		orderBy = fmt.Sprintf("CASE WHEN a.tenant_id = %d THEN 0 ELSE 1 END, a.published_at DESC NULLS LAST", filter.TenantID)
-	}
 	if filter.SortBy == "trending" || filter.SortBy == "views" {
 		orderBy = "a.view_count DESC, a.published_at DESC"
 	} else if filter.SortBy == "oldest" {
@@ -569,7 +560,7 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 		LEFT JOIN article_tags at ON at.article_id = a.id
 		LEFT JOIN tags t ON t.id = at.tag_id
 		WHERE %s
-		GROUP BY a.id, u.display_name
+		GROUP BY a.id, a.title, a.slug, a.excerpt, a.status, a.language, a.author_id, u.display_name, a.is_breaking, a.is_featured, a.is_national, a.featured_image, a.view_count, a.published_at, a.created_at, a.updated_at
 		ORDER BY %s
 		LIMIT $%d OFFSET $%d
 	`, where, orderBy, argIdx, argIdx+1)
@@ -600,9 +591,9 @@ func (s *Service) ListArticles(ctx context.Context, tx pgx.Tx, filter ListArticl
 }
 
 // ListCategories returns all categories in the master taxonomy.
-func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) ([]Category, error) {
+func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx) ([]Category, error) {
 	query := `
-		SELECT id, COALESCE(tenant_id, 1), parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+		SELECT id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
 		FROM categories
 		ORDER BY level ASC, sort_order ASC, name ASC
 	`
@@ -615,7 +606,7 @@ func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) (
 	var list []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
+		if err := rows.Scan(&c.ID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
 			return nil, err
 		}
 		list = append(list, c)
@@ -623,9 +614,9 @@ func (s *Service) ListCategories(ctx context.Context, tx pgx.Tx, tenantID int) (
 	return list, rows.Err()
 }
 
-func (s *Service) ListCategoriesDirect(ctx context.Context, tenantID int) ([]Category, error) {
+func (s *Service) ListCategoriesDirect(ctx context.Context) ([]Category, error) {
 	query := `
-		SELECT id, COALESCE(tenant_id, 1), parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+		SELECT id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
 		FROM categories
 		ORDER BY level ASC, sort_order ASC, name ASC
 	`
@@ -638,7 +629,7 @@ func (s *Service) ListCategoriesDirect(ctx context.Context, tenantID int) ([]Cat
 	var list []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
+		if err := rows.Scan(&c.ID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder); err != nil {
 			return nil, err
 		}
 		list = append(list, c)
@@ -648,7 +639,7 @@ func (s *Service) ListCategoriesDirect(ctx context.Context, tenantID int) ([]Cat
 
 // ListCategoriesTree builds and returns the full nested hierarchical taxonomy tree.
 func (s *Service) ListCategoriesTree(ctx context.Context, tx pgx.Tx) ([]Category, error) {
-	flat, err := s.ListCategories(ctx, tx, 1)
+	flat, err := s.ListCategories(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -678,20 +669,74 @@ func (s *Service) ListCategoriesTree(ctx context.Context, tx pgx.Tx) ([]Category
 	return roots, nil
 }
 
-// CreateCategory creates a new category (supports parent_id, level, icon, path).
-func (s *Service) CreateCategory(ctx context.Context, tx pgx.Tx, tenantID int, name, slug string) (*Category, error) {
-	if slug == "" {
-		slug = strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+// CreateCategoryInput represents payload to create or update a category.
+type CreateCategoryInput struct {
+	Name      string `json:"name"`
+	Slug      string `json:"slug"`
+	ParentID  *int   `json:"parent_id,omitempty"`
+	SortOrder int    `json:"sort_order,omitempty"`
+	Icon      string `json:"icon,omitempty"`
+}
+
+// CreateCategory creates a new category (supports parent_id, level, icon, path, sort_order).
+func (s *Service) CreateCategory(ctx context.Context, tx pgx.Tx, input CreateCategoryInput) (*Category, error) {
+	if input.Slug == "" {
+		input.Slug = strings.ToLower(strings.ReplaceAll(input.Name, " ", "-"))
+	}
+	level := 1
+	var pathStr string = input.Name
+	if input.ParentID != nil && *input.ParentID > 0 {
+		level = 2
+		var parentPath string
+		_ = tx.QueryRow(ctx, "SELECT path FROM categories WHERE id = $1", *input.ParentID).Scan(&parentPath)
+		if parentPath != "" {
+			pathStr = parentPath + " > " + input.Name
+		}
 	}
 	var c Category
 	err := tx.QueryRow(ctx, `
-		INSERT INTO categories (tenant_id, name, slug, sort_order)
-		VALUES ($1, $2, $3, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories WHERE tenant_id = $1))
-		ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-		RETURNING id, tenant_id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
-	`, tenantID, name, slug).Scan(&c.ID, &c.TenantID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder)
+		INSERT INTO categories (parent_id, level, name, slug, icon, path, sort_order)
+		VALUES ($1, $2, $3, $4, $5, $6, COALESCE(NULLIF($7, 0), (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories)))
+		ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name, icon = EXCLUDED.icon, parent_id = EXCLUDED.parent_id
+		RETURNING id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+	`, input.ParentID, level, input.Name, input.Slug, input.Icon, pathStr, input.SortOrder).Scan(&c.ID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder)
 	if err != nil {
 		return nil, fmt.Errorf("create category: %w", err)
+	}
+	return &c, nil
+}
+
+// UpdateCategory modifies an existing category by ID.
+func (s *Service) UpdateCategory(ctx context.Context, tx pgx.Tx, id int, input CreateCategoryInput) (*Category, error) {
+	if input.Slug == "" {
+		input.Slug = strings.ToLower(strings.ReplaceAll(input.Name, " ", "-"))
+	}
+	level := 1
+	var pathStr string = input.Name
+	if input.ParentID != nil && *input.ParentID > 0 {
+		level = 2
+		var parentPath string
+		_ = tx.QueryRow(ctx, "SELECT path FROM categories WHERE id = $1", *input.ParentID).Scan(&parentPath)
+		if parentPath != "" {
+			pathStr = parentPath + " > " + input.Name
+		}
+	}
+	var c Category
+	err := tx.QueryRow(ctx, `
+		UPDATE categories SET
+			name = COALESCE(NULLIF($2, ''), name),
+			slug = COALESCE(NULLIF($3, ''), slug),
+			parent_id = $4,
+			level = $5,
+			icon = $6,
+			path = $7,
+			sort_order = COALESCE(NULLIF($8, 0), sort_order),
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, parent_id, COALESCE(level, 1), name, slug, COALESCE(icon, ''), COALESCE(path, name), sort_order
+	`, id, input.Name, input.Slug, input.ParentID, level, input.Icon, pathStr, input.SortOrder).Scan(&c.ID, &c.ParentID, &c.Level, &c.Name, &c.Slug, &c.Icon, &c.Path, &c.SortOrder)
+	if err != nil {
+		return nil, fmt.Errorf("update category: %w", err)
 	}
 	return &c, nil
 }
@@ -705,17 +750,15 @@ func (s *Service) DeleteCategory(ctx context.Context, tx pgx.Tx, id int) error {
 // Tag represents an article keyword tag.
 type Tag struct {
 	ID         int    `json:"id"`
-	TenantID   int    `json:"tenant_id"`
 	Name       string `json:"name"`
 	Slug       string `json:"slug"`
 	UsageCount int    `json:"usage_count,omitempty"`
 }
 
-// ListTags returns all tags for a tenant.
-func (s *Service) ListTags(ctx context.Context, tx pgx.Tx, tenantID int) ([]Tag, error) {
-	_, _ = tx.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+// ListTags returns all tags.
+func (s *Service) ListTags(ctx context.Context, tx pgx.Tx) ([]Tag, error) {
 	query := `
-		SELECT t.id, COALESCE(t.tenant_id, 1), t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
+		SELECT t.id, t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
 		FROM tags t
 		LEFT JOIN (
 			SELECT tag_id, COUNT(*) as cnt FROM article_tags GROUP BY tag_id
@@ -731,7 +774,7 @@ func (s *Service) ListTags(ctx context.Context, tx pgx.Tx, tenantID int) ([]Tag,
 	var list []Tag
 	for rows.Next() {
 		var t Tag
-		if err := rows.Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
 			return nil, err
 		}
 		list = append(list, t)
@@ -739,10 +782,9 @@ func (s *Service) ListTags(ctx context.Context, tx pgx.Tx, tenantID int) ([]Tag,
 	return list, rows.Err()
 }
 
-func (s *Service) ListTagsDirect(ctx context.Context, tenantID int) ([]Tag, error) {
-	_, _ = s.pool.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+func (s *Service) ListTagsDirect(ctx context.Context) ([]Tag, error) {
 	query := `
-		SELECT t.id, COALESCE(t.tenant_id, 1), t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
+		SELECT t.id, t.name, t.slug, COALESCE(at_cnt.cnt, 0) as usage_count
 		FROM tags t
 		LEFT JOIN (
 			SELECT tag_id, COUNT(*) as cnt FROM article_tags GROUP BY tag_id
@@ -758,7 +800,7 @@ func (s *Service) ListTagsDirect(ctx context.Context, tenantID int) ([]Tag, erro
 	var list []Tag
 	for rows.Next() {
 		var t Tag
-		if err := rows.Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &t.UsageCount); err != nil {
 			return nil, err
 		}
 		list = append(list, t)
@@ -767,18 +809,17 @@ func (s *Service) ListTagsDirect(ctx context.Context, tenantID int) ([]Tag, erro
 }
 
 // CreateTag creates a new tag.
-func (s *Service) CreateTag(ctx context.Context, tx pgx.Tx, tenantID int, name, slug string) (*Tag, error) {
-	_, _ = tx.Exec(ctx, `ALTER TABLE tags ADD COLUMN IF NOT EXISTS tenant_id INT DEFAULT 1;`)
+func (s *Service) CreateTag(ctx context.Context, tx pgx.Tx, name, slug string) (*Tag, error) {
 	if slug == "" {
 		slug = strings.ToLower(strings.ReplaceAll(name, " ", "-"))
 	}
 	var t Tag
 	err := tx.QueryRow(ctx, `
-		INSERT INTO tags (name, slug, tenant_id)
-		VALUES ($1, $2, $3)
+		INSERT INTO tags (name, slug)
+		VALUES ($1, $2)
 		ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
-		RETURNING id, COALESCE(tenant_id, 1), name, slug
-	`, name, slug, tenantID).Scan(&t.ID, &t.TenantID, &t.Name, &t.Slug)
+		RETURNING id, name, slug
+	`, name, slug).Scan(&t.ID, &t.Name, &t.Slug)
 	if err != nil {
 		return nil, fmt.Errorf("create tag: %w", err)
 	}
@@ -905,9 +946,9 @@ func (s *Service) ScheduleArticle(ctx context.Context, tx pgx.Tx, articleID uuid
 
 // ─── Stories (Multi-Language Variant Linking) ───
 
-func (s *Service) CreateStory(ctx context.Context, tx pgx.Tx, tenantID int, slug string) (uuid.UUID, error) {
+func (s *Service) CreateStory(ctx context.Context, tx pgx.Tx, slug string) (uuid.UUID, error) {
 	var id uuid.UUID
-	err := tx.QueryRow(ctx, "INSERT INTO stories (tenant_id) VALUES ($1) RETURNING id", tenantID).Scan(&id)
+	err := tx.QueryRow(ctx, "INSERT INTO stories (slug) VALUES ($1) RETURNING id", slug).Scan(&id)
 	return id, err
 }
 

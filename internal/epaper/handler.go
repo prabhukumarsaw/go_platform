@@ -5,7 +5,6 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
-	"newsplatform/api/pkg/middleware"
 	"newsplatform/api/pkg/response"
 )
 
@@ -27,12 +26,6 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 
 func (h *Handler) List(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
-
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
 
 	var districtID *int
 	if dStr := c.Query("district_id"); dStr != "" {
@@ -43,7 +36,7 @@ func (h *Handler) List(c *fiber.Ctx) error {
 
 	dateStr := c.Query("date")
 
-	epapers, err := h.service.ListEPapers(c.Context(), tx, tenantID, districtID, dateStr)
+	epapers, err := h.service.ListEPapers(c.Context(), tx, districtID, dateStr)
 	if err != nil {
 		return response.InternalError(c, "Failed to fetch epapers: "+err.Error())
 	}
@@ -52,7 +45,6 @@ func (h *Handler) List(c *fiber.Ctx) error {
 }
 
 func (h *Handler) Create(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
 	tx := c.Locals("tx").(pgx.Tx)
 
 	var req struct {
@@ -67,7 +59,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Edition date, title, and PDF URL are required")
 	}
 
-	epaper, err := h.service.CreateEPaper(c.Context(), tx, int(sess.ActiveTenantID), req.DistrictID, req.EditionDate, req.Title, req.PDFURL, req.ThumbnailURL, req.PageCount)
+	epaper, err := h.service.CreateEPaper(c.Context(), tx, req.DistrictID, req.EditionDate, req.Title, req.PDFURL, req.ThumbnailURL, req.PageCount)
 	if err != nil {
 		return response.InternalError(c, "Failed to create epaper: "+err.Error())
 	}

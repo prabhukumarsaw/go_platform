@@ -21,7 +21,6 @@ type PollOption struct {
 
 type Poll struct {
 	ID         uuid.UUID    `json:"id"`
-	TenantID   int          `json:"tenant_id"`
 	Question   string       `json:"question"`
 	Language   string       `json:"language"`
 	Options    []PollOption `json:"options"`
@@ -43,16 +42,15 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 	}
 }
 
-func (s *Service) GetActivePoll(ctx context.Context, tx pgx.Tx, tenantID int, language string) (*Poll, error) {
+func (s *Service) GetActivePoll(ctx context.Context, tx pgx.Tx, language string) (*Poll, error) {
 	if language == "" {
 		language = "hi"
 	}
 
 	query := `
-		SELECT id, tenant_id, question, language, options, total_votes, is_active, expires_at, created_at
+		SELECT id, question, language, options, total_votes, is_active, expires_at, created_at
 		FROM polls
-		WHERE (tenant_id = $1 OR tenant_id = 1)
-		  AND language = $2
+		WHERE language = $1
 		  AND is_active = TRUE
 		  AND (expires_at IS NULL OR expires_at > NOW())
 		ORDER BY created_at DESC
@@ -61,8 +59,8 @@ func (s *Service) GetActivePoll(ctx context.Context, tx pgx.Tx, tenantID int, la
 
 	var p Poll
 	var rawOptions json.RawMessage
-	err := tx.QueryRow(ctx, query, tenantID, language).Scan(
-		&p.ID, &p.TenantID, &p.Question, &p.Language,
+	err := tx.QueryRow(ctx, query, language).Scan(
+		&p.ID, &p.Question, &p.Language,
 		&rawOptions, &p.TotalVotes, &p.IsActive, &p.ExpiresAt, &p.CreatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -133,8 +131,8 @@ func (s *Service) Vote(ctx context.Context, tx pgx.Tx, pollID uuid.UUID, optionI
 
 	// Return updated poll
 	var updatedPoll Poll
-	_ = tx.QueryRow(ctx, `SELECT id, tenant_id, question, language, options, total_votes, is_active, expires_at, created_at FROM polls WHERE id = $1`, pollID).
-		Scan(&updatedPoll.ID, &updatedPoll.TenantID, &updatedPoll.Question, &updatedPoll.Language, &rawOptions, &updatedPoll.TotalVotes, &updatedPoll.IsActive, &updatedPoll.ExpiresAt, &updatedPoll.CreatedAt)
+	_ = tx.QueryRow(ctx, `SELECT id, question, language, options, total_votes, is_active, expires_at, created_at FROM polls WHERE id = $1`, pollID).
+		Scan(&updatedPoll.ID, &updatedPoll.Question, &updatedPoll.Language, &rawOptions, &updatedPoll.TotalVotes, &updatedPoll.IsActive, &updatedPoll.ExpiresAt, &updatedPoll.CreatedAt)
 	_ = json.Unmarshal(rawOptions, &updatedPoll.Options)
 
 	if updatedPoll.TotalVotes > 0 {

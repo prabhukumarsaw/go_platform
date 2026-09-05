@@ -156,7 +156,7 @@ func main() {
 	}))
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "http://localhost:3000",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Tenant-ID",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, PUT, DELETE, PATCH, OPTIONS",
 	}))
 	app.Use(compress.New(compress.Config{

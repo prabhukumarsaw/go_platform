@@ -91,14 +91,14 @@ func (s *Scheduler) publishScheduledArticles(ctx context.Context) error {
 	return nil
 }
 
-// recalculateTrending refreshes trending article ranks per tenant in Redis.
+// recalculateTrending refreshes trending article ranks in Redis.
 func (s *Scheduler) recalculateTrending(ctx context.Context) error {
 	if s.redis == nil {
 		return nil
 	}
 
 	query := `
-		SELECT id, COALESCE(tenant_id, 1), view_count
+		SELECT id, view_count
 		FROM articles
 		WHERE status = 'published' AND published_at > NOW() - INTERVAL '7 days'
 		ORDER BY view_count DESC
@@ -114,9 +114,8 @@ func (s *Scheduler) recalculateTrending(ctx context.Context) error {
 	pipe := s.redis.Pipeline()
 	for rows.Next() {
 		var id string
-		var tenantID int
 		var viewCount int64
-		if err := rows.Scan(&id, &tenantID, &viewCount); err != nil {
+		if err := rows.Scan(&id, &viewCount); err != nil {
 			return err
 		}
 
@@ -125,12 +124,6 @@ func (s *Scheduler) recalculateTrending(ctx context.Context) error {
 			Member: id,
 		})
 		pipe.Expire(ctx, "trending:national", 10*time.Minute)
-
-		pipe.ZAdd(ctx, "trending:tenant:1", redis.Z{
-			Score:  float64(viewCount),
-			Member: id,
-		})
-		pipe.Expire(ctx, "trending:tenant:1", 10*time.Minute)
 	}
 
 	_, err = pipe.Exec(ctx)

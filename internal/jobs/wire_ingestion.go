@@ -36,15 +36,14 @@ type RSSItem struct {
 type WireFeedSource struct {
 	AgencyName string // PTI, ANI, Reuters
 	URL        string
-	TenantID   int    // default 1 = National
 	Language   string // en, hi
 }
 
 // IngestWireFeeds polls configured news wire feeds and drafts stories in the database.
 func (s *Scheduler) IngestWireFeeds(ctx context.Context) error {
 	sources := []WireFeedSource{
-		{AgencyName: "PTI", URL: "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", TenantID: 1, Language: "en"},
-		{AgencyName: "National Wire", URL: "https://www.thehindu.com/news/national/feeder/default.rss", TenantID: 1, Language: "en"},
+		{AgencyName: "PTI", URL: "https://timesofindia.indiatimes.com/rssfeeds/-2128936835.cms", Language: "en"},
+		{AgencyName: "National Wire", URL: "https://www.thehindu.com/news/national/feeder/default.rss", Language: "en"},
 	}
 
 	for _, src := range sources {
@@ -115,8 +114,8 @@ func (s *Scheduler) ingestSingleSource(ctx context.Context, src WireFeedSource) 
 		// Insert wire dispatch as draft ready for editorial desk review
 		query := `
 			INSERT INTO articles
-				(tenant_id, language, title, slug, body, excerpt, status, author_id, is_national, meta_title, meta_description)
-			VALUES ($1, $2, $3, $4, $5, $6, 'draft', 1, TRUE, $7, $8)
+				(language, title, slug, body, excerpt, status, author_id, is_national, meta_title, meta_description)
+			VALUES ($1, $2, $3, $4, $5, 'draft', 1, TRUE, $6, $7)
 			ON CONFLICT DO NOTHING
 		`
 
@@ -131,7 +130,7 @@ func (s *Scheduler) ingestSingleSource(ctx context.Context, src WireFeedSource) 
 		}
 
 		_, err := s.pool.Exec(ctx, query,
-			src.TenantID, src.Language, cleanTitle, slug, bodyJSON, excerpt,
+			src.Language, cleanTitle, slug, bodyJSON, excerpt,
 			metaTitle, excerpt,
 		)
 		if err == nil {

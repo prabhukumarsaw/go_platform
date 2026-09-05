@@ -13,7 +13,6 @@ import (
 // It is attached to the Fiber context and used by downstream handlers and the IAM evaluator.
 type Session struct {
 	UserID           int64    `json:"user_id"`
-	ActiveTenantID   int64    `json:"active_tenant_id"`
 	ActiveDistrictID *int64   `json:"active_district_id,omitempty"`
 	Roles            []string `json:"roles"`
 	IsStaff          bool     `json:"is_staff"`
@@ -35,7 +34,6 @@ func SessionFromCtx(c *fiber.Ctx) *Session {
 type JWTClaims struct {
 	jwt.RegisteredClaims
 	UserID           int64    `json:"uid"`
-	ActiveTenantID   int64    `json:"tid"`
 	ActiveDistrictID *int64   `json:"did,omitempty"`
 	Roles            []string `json:"roles"`
 	IsStaff          bool     `json:"staff"`
@@ -76,7 +74,6 @@ func RequireAuth(cfg config.JWTConfig) fiber.Handler {
 
 		sess := &Session{
 			UserID:           claims.UserID,
-			ActiveTenantID:   claims.ActiveTenantID,
 			ActiveDistrictID: claims.ActiveDistrictID,
 			Roles:            claims.Roles,
 			IsStaff:          claims.IsStaff,
@@ -129,7 +126,6 @@ func OptionalAuth(cfg config.JWTConfig) fiber.Handler {
 			if claims, ok := token.Claims.(*JWTClaims); ok && token.Valid {
 				c.Locals(sessionKey, &Session{
 					UserID:           claims.UserID,
-					ActiveTenantID:   claims.ActiveTenantID,
 					ActiveDistrictID: claims.ActiveDistrictID,
 					Roles:            claims.Roles,
 					IsStaff:          claims.IsStaff,

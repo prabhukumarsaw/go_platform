@@ -63,10 +63,15 @@ func main() {
 	// Create schema_migrations table if not exists
 	_, _ = conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())`)
 
+	if len(os.Args) > 1 && (os.Args[1] == "--force" || os.Args[1] == "-f") {
+		log.Warn().Msg("⚡ Force flag detected! Cleaning schema_migrations to re-execute migration...")
+		_, _ = conn.Exec(ctx, `DELETE FROM schema_migrations WHERE version = '001_init_production_schema.up.sql'`)
+	}
+
 	var tablesExist bool
 	_ = conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='categories')`).Scan(&tablesExist)
 	if tablesExist {
-		_, _ = conn.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ('001_tenants.up.sql'), ('002_users_auth.up.sql'), ('003_iam_rbac.up.sql'), ('004_content.up.sql'), ('005_rls_policies.up.sql'), ('006_ads_seo.up.sql') ON CONFLICT DO NOTHING`)
+		_, _ = conn.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ('001_init_production_schema.up.sql') ON CONFLICT DO NOTHING`)
 	}
 
 	for _, filename := range upFiles {
@@ -108,5 +113,5 @@ func main() {
 		Int("categories", categoryCount).
 		Int("users", userCount).
 		Int("roles", roleCount).
-		Msg("🎉 Database migrations and seeding completed successfully!")
+		Msg("🎉 Database migrations and total production wipe completed successfully!")
 }

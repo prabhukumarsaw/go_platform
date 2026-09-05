@@ -3,6 +3,8 @@ package analytics
 type AnalyticsOverview struct {
 	TotalArticles       int64                `json:"total_articles"`
 	TotalPublished      int64                `json:"total_published"`
+	TotalDrafts         int64                `json:"total_drafts"`
+	TotalReview         int64                `json:"total_review"`
 	TotalViews          int64                `json:"total_views"`
 	TotalBreaking       int64                `json:"total_breaking"`
 	TotalSubscribers    int64                `json:"total_subscribers"`
@@ -18,8 +20,6 @@ type RegionalReadership struct {
 	Articles   int64  `json:"articles"`
 }
 
-// Backward compatibility alias
-type TenantReadership = RegionalReadership
 
 type CategoryReadership struct {
 	CategoryName string `json:"category_name"`

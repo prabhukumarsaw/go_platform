@@ -72,7 +72,7 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Title and Cover image are required")
 	}
 
-	story, err := h.service.CreateWebStory(c.Context(), tx, int(sess.ActiveTenantID), sess.UserID, req.Title, req.Language, req.CoverImage, req.Slides)
+	story, err := h.service.CreateWebStory(c.Context(), tx, sess.UserID, req.Title, req.Language, req.CoverImage, req.Slides)
 	if err != nil {
 		return response.InternalError(c, "Failed to create web story: "+err.Error())
 	}

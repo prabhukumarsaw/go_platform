@@ -463,7 +463,7 @@ func (r *Repository) AssignRolePermissions(ctx context.Context, tx pgx.Tx, roleI
 
 func (r *Repository) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
 	query := `
-		SELECT id, name, label, parent_id, COALESCE(icon,''), COALESCE(path,''), sort_order, COALESCE(is_active, true)
+		SELECT id, name, label, COALESCE(path,''), sort_order, COALESCE(is_active, true)
 		FROM menus
 		WHERE is_active IS NOT FALSE
 		ORDER BY sort_order ASC, id ASC
@@ -477,7 +477,7 @@ func (r *Repository) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
 	var menus []Menu
 	for rows.Next() {
 		var m Menu
-		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.ParentID, &m.Icon, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
 			return nil, err
 		}
 		menus = append(menus, m)
@@ -487,7 +487,7 @@ func (r *Repository) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
 
 func (r *Repository) ListMenusDirect(ctx context.Context) ([]Menu, error) {
 	query := `
-		SELECT id, name, label, parent_id, COALESCE(icon,''), COALESCE(path,''), sort_order, COALESCE(is_active, true)
+		SELECT id, name, label, COALESCE(path,''), sort_order, COALESCE(is_active, true)
 		FROM menus
 		WHERE is_active IS NOT FALSE
 		ORDER BY sort_order ASC, id ASC
@@ -501,7 +501,7 @@ func (r *Repository) ListMenusDirect(ctx context.Context) ([]Menu, error) {
 	var menus []Menu
 	for rows.Next() {
 		var m Menu
-		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.ParentID, &m.Icon, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
 			return nil, err
 		}
 		menus = append(menus, m)

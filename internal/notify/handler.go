@@ -32,10 +32,6 @@ func (h *Handler) RegisterAdminRoutes(router fiber.Router) {
 // Subscribe handles newsletter opt-in.
 func (h *Handler) Subscribe(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	tenantID, _ := c.Locals("tenant_id").(int64)
-	if tenantID == 0 {
-		tenantID = 1 // Default to national
-	}
 
 	var input SubscribeInput
 	if err := c.BodyParser(&input); err != nil {
@@ -51,7 +47,7 @@ func (h *Handler) Subscribe(c *fiber.Ctx) error {
 		userID = &sess.UserID
 	}
 
-	sub, err := h.service.Subscribe(c.Context(), tx, int(tenantID), userID, input)
+	sub, err := h.service.Subscribe(c.Context(), tx, userID, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to subscribe")
 	}
@@ -62,10 +58,6 @@ func (h *Handler) Subscribe(c *fiber.Ctx) error {
 // Unsubscribe handles newsletter opt-out.
 func (h *Handler) Unsubscribe(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	tenantID, _ := c.Locals("tenant_id").(int64)
-	if tenantID == 0 {
-		tenantID = 1
-	}
 
 	var body struct {
 		Email string `json:"email"`
@@ -78,7 +70,7 @@ func (h *Handler) Unsubscribe(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Email is required")
 	}
 
-	if err := h.service.Unsubscribe(c.Context(), tx, int(tenantID), body.Email); err != nil {
+	if err := h.service.Unsubscribe(c.Context(), tx, body.Email); err != nil {
 		return response.InternalError(c, "Failed to unsubscribe")
 	}
 
@@ -88,10 +80,6 @@ func (h *Handler) Unsubscribe(c *fiber.Ctx) error {
 // SubscribePush handles browser Web Push subscription registration.
 func (h *Handler) SubscribePush(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	tenantID, _ := c.Locals("tenant_id").(int64)
-	if tenantID == 0 {
-		tenantID = 1
-	}
 
 	var input PushSubscribeInput
 	if err := c.BodyParser(&input); err != nil || input.Endpoint == "" || input.P256dhKey == "" || input.AuthKey == "" {
@@ -105,7 +93,7 @@ func (h *Handler) SubscribePush(c *fiber.Ctx) error {
 		userID = &sess.UserID
 	}
 
-	ps, err := h.service.SavePushSubscription(c.Context(), tx, int(tenantID), userID, input)
+	ps, err := h.service.SavePushSubscription(c.Context(), tx, userID, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to save push subscription: "+err.Error())
 	}
@@ -115,12 +103,6 @@ func (h *Handler) SubscribePush(c *fiber.Ctx) error {
 
 // BroadcastPush dispatches breaking news push notification to subscribers.
 func (h *Handler) BroadcastPush(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
-	tenantID := int(sess.ActiveTenantID)
-	if tenantID == 0 {
-		tenantID = 1
-	}
-
 	var body struct {
 		DistrictID *int   `json:"district_id"`
 		Title      string `json:"title"`
@@ -130,7 +112,7 @@ func (h *Handler) BroadcastPush(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Title and slug are required")
 	}
 
-	count, err := h.service.BroadcastBreakingNews(c.Context(), tenantID, body.DistrictID, body.Title, body.Slug)
+	count, err := h.service.BroadcastBreakingNews(c.Context(), body.DistrictID, body.Title, body.Slug)
 	if err != nil {
 		return response.InternalError(c, "Broadcast failed: "+err.Error())
 	}

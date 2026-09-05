@@ -140,12 +140,12 @@ func (s *Service) AuthenticateGoogle(ctx context.Context, code string) (*TokenPa
 		return nil, nil, err
 	}
 
-	roles, tenantID, err := s.getUserContext(ctx, tx, user.ID)
+	roles, err := s.getUserRoles(ctx, tx, user.ID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	tokens, err := s.generateTokenPair(ctx, tx, user.ID, tenantID, nil, roles, user.IsStaff, user.IsSuperAdmin)
+	tokens, err := s.generateTokenPair(ctx, tx, user.ID, nil, roles, user.IsStaff, user.IsSuperAdmin)
 	if err != nil {
 		return nil, nil, err
 	}

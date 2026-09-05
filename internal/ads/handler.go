@@ -5,7 +5,6 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
-	"newsplatform/api/pkg/middleware"
 	"newsplatform/api/pkg/response"
 )
 
@@ -41,7 +40,6 @@ func (h *Handler) ListSlots(c *fiber.Ctx) error {
 
 // CreateSlot creates a new ad slot.
 func (h *Handler) CreateSlot(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
 	tx := c.Locals("tx").(pgx.Tx)
 
 	var input CreateAdSlotInput
@@ -52,7 +50,7 @@ func (h *Handler) CreateSlot(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Name and slot_type are required")
 	}
 
-	slot, err := h.service.CreateAdSlot(c.Context(), tx, int(sess.ActiveTenantID), input)
+	slot, err := h.service.CreateAdSlot(c.Context(), tx, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to create ad slot")
 	}

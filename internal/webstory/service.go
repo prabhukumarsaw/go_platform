@@ -15,7 +15,6 @@ import (
 
 type WebStory struct {
 	ID          uuid.UUID       `json:"id"`
-	TenantID    int             `json:"tenant_id"`
 	Title       string          `json:"title"`
 	Slug        string          `json:"slug"`
 	Language    string          `json:"language"`
@@ -49,7 +48,7 @@ func (s *Service) ListWebStories(ctx context.Context, tx pgx.Tx, language string
 	}
 
 	query := `
-		SELECT id, tenant_id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
+		SELECT id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
 		FROM web_stories
 		WHERE status = 'published' AND language = $1
 		ORDER BY published_at DESC
@@ -66,7 +65,7 @@ func (s *Service) ListWebStories(ctx context.Context, tx pgx.Tx, language string
 	for rows.Next() {
 		var st WebStory
 		if err := rows.Scan(
-			&st.ID, &st.TenantID, &st.Title, &st.Slug, &st.Language,
+			&st.ID, &st.Title, &st.Slug, &st.Language,
 			&st.CoverImage, &st.Slides, &st.AuthorID, &st.Status,
 			&st.ViewCount, &st.PublishedAt, &st.CreatedAt,
 		); err != nil {
@@ -79,14 +78,14 @@ func (s *Service) ListWebStories(ctx context.Context, tx pgx.Tx, language string
 
 func (s *Service) GetWebStoryBySlug(ctx context.Context, tx pgx.Tx, slug, language string) (*WebStory, error) {
 	query := `
-		SELECT id, tenant_id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
+		SELECT id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
 		FROM web_stories
 		WHERE slug = $1 AND language = $2 AND status = 'published'
 	`
 
 	var st WebStory
 	err := tx.QueryRow(ctx, query, slug, language).Scan(
-		&st.ID, &st.TenantID, &st.Title, &st.Slug, &st.Language,
+		&st.ID, &st.Title, &st.Slug, &st.Language,
 		&st.CoverImage, &st.Slides, &st.AuthorID, &st.Status,
 		&st.ViewCount, &st.PublishedAt, &st.CreatedAt,
 	)
@@ -105,21 +104,21 @@ func (s *Service) GetWebStoryBySlug(ctx context.Context, tx pgx.Tx, slug, langua
 	return &st, nil
 }
 
-func (s *Service) CreateWebStory(ctx context.Context, tx pgx.Tx, tenantID int, authorID int64, title, language, coverImage string, slides json.RawMessage) (*WebStory, error) {
+func (s *Service) CreateWebStory(ctx context.Context, tx pgx.Tx, authorID int64, title, language, coverImage string, slides json.RawMessage) (*WebStory, error) {
 	slug := generateSlug(title)
 	if language == "" {
 		language = "hi"
 	}
 
 	query := `
-		INSERT INTO web_stories (tenant_id, title, slug, language, cover_image, slides, author_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, tenant_id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
+		INSERT INTO web_stories (title, slug, language, cover_image, slides, author_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, title, slug, language, cover_image, slides, author_id, status, view_count, published_at, created_at
 	`
 
 	var st WebStory
-	err := tx.QueryRow(ctx, query, tenantID, title, slug, language, coverImage, slides, authorID).Scan(
-		&st.ID, &st.TenantID, &st.Title, &st.Slug, &st.Language,
+	err := tx.QueryRow(ctx, query, title, slug, language, coverImage, slides, authorID).Scan(
+		&st.ID, &st.Title, &st.Slug, &st.Language,
 		&st.CoverImage, &st.Slides, &st.AuthorID, &st.Status,
 		&st.ViewCount, &st.PublishedAt, &st.CreatedAt,
 	)

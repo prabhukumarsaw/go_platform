@@ -32,7 +32,6 @@ func (h *Handler) RegisterRoutes(router fiber.Router, jwtCfg config.JWTConfig) {
 	auth.Post("/reset-password", h.ResetPassword)
 	auth.Post("/otp/send", h.SendOTP)
 	auth.Post("/otp/verify", h.VerifyOTP)
-	auth.Post("/switch-tenant", h.SwitchTenant)
 	auth.Post("/google/callback", h.GoogleCallback)
 
 	// Authenticated routes
@@ -89,6 +88,7 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 
 	tokens, user, err := h.service.LoginWithEmail(c.Context(), input)
 	if err != nil {
+		h.service.logger.Error().Err(err).Msg("Login failed")
 		return response.Unauthorized(c, "Invalid credentials")
 	}
 
@@ -187,33 +187,7 @@ func (h *Handler) VerifyOTP(c *fiber.Ctx) error {
 	})
 }
 
-// SwitchTenantRequest is the payload to change the user's active tenant context.
-type SwitchTenantRequest struct {
-	TargetTenantID int64 `json:"target_tenant_id"`
-}
 
-// SwitchTenant generates a fresh JWT with the new active tenant claim.
-func (h *Handler) SwitchTenant(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
-	if sess == nil {
-		return response.Unauthorized(c, "Not authenticated")
-	}
-
-	var req SwitchTenantRequest
-	if err := c.BodyParser(&req); err != nil || req.TargetTenantID == 0 {
-		return response.BadRequest(c, "Valid target_tenant_id is required")
-	}
-
-	tokens, err := h.service.SwitchTenant(c.Context(), sess.UserID, req.TargetTenantID)
-	if err != nil {
-		return response.Forbidden(c, err.Error())
-	}
-
-	return response.Success(c, fiber.Map{
-		"message": "Tenant switched successfully",
-		"tokens":  tokens,
-	})
-}
 
 // SetupTOTP initiates TOTP generation for employee accounts.
 func (h *Handler) SetupTOTP(c *fiber.Ctx) error {

@@ -43,7 +43,6 @@ func NewService(pool *pgxpool.Pool, cfg config.MediaConfig, logger zerolog.Logge
 // ─── Models ───────────// Media represents a media file record.
 type Media struct {
 	ID           uuid.UUID `json:"id"`
-	TenantID     int       `json:"tenant_id"`
 	UploaderID   int64     `json:"uploader_id"`
 	Filename     string    `json:"filename"`
 	OriginalName string    `json:"original_name"`
@@ -69,7 +68,7 @@ type FolderSummary struct {
 // ─── Upload ─────────────────────────────────────
 
 // UploadFile saves a file to local storage and records metadata in the database.
-func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, tenantID int, uploaderID int64, filename string, mimeType string, category string, folder string, fileSize int64, reader io.Reader) (*Media, error) {
+func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, uploaderID int64, filename string, mimeType string, category string, folder string, fileSize int64, reader io.Reader) (*Media, error) {
 	// Validate file size
 	if fileSize > s.cfg.MaxFileSize {
 		return nil, fmt.Errorf("file exceeds maximum size of %d bytes", s.cfg.MaxFileSize)
@@ -87,13 +86,12 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, tenantID int, uploa
 		folder = "general"
 	}
 
-	// Generate storage path: tenant_{id}/{category}/{year}/{month}/{uuid}_{filename}
+	// Generate storage path: {category}/{year}/{month}/{uuid}_{filename}
 	now := time.Now()
 	mediaID := uuid.New()
 	ext := filepath.Ext(filename)
 	storedFilename := fmt.Sprintf("%s%s", mediaID.String()[:12], ext)
 	relativePath := filepath.Join(
-		fmt.Sprintf("tenant_%d", tenantID),
 		category,
 		fmt.Sprintf("%d", now.Year()),
 		fmt.Sprintf("%02d", now.Month()),
@@ -141,15 +139,15 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, tenantID int, uploa
 	// Insert metadata into database
 	query := `
 		INSERT INTO media
-			(id, tenant_id, uploader_id, filename, original_name, mime_type,
+			(id, uploader_id, filename, original_name, mime_type,
 			 category, folder, file_size, storage_path, alt_text, caption, width, height)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', '', $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', '', $10, $11)
 		RETURNING created_at
 	`
 
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, query,
-		mediaID, tenantID, uploaderID, storedFilename, filename, mimeType,
+		mediaID, uploaderID, storedFilename, filename, mimeType,
 		category, folder, written, filepath.ToSlash(relativePath), width, height,
 	).Scan(&createdAt)
 	if err != nil {
@@ -159,7 +157,6 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, tenantID int, uploa
 
 	return &Media{
 		ID:           mediaID,
-		TenantID:     tenantID,
 		UploaderID:   uploaderID,
 		Filename:     storedFilename,
 		OriginalName: filename,
@@ -219,7 +216,7 @@ func (s *Service) UploadAvatar(ctx context.Context, userID int64, filename strin
 // ─── List / Search / Filter ─────────────────────
 
 // ListMedia returns media files filtered by category, folder, mimeType, and search query.
-func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, category string, folder string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
+func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, folder string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -227,9 +224,9 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, catego
 		perPage = 20
 	}
 
-	whereClauses := []string{"(tenant_id = $1 OR $1 = 1)"}
-	args := []interface{}{tenantID}
-	argIdx := 2
+	whereClauses := []string{"1=1"}
+	var args []interface{}
+	argIdx := 1
 
 	if category != "" && category != "all" {
 		whereClauses = append(whereClauses, fmt.Sprintf("category = $%d", argIdx))
@@ -265,7 +262,7 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, catego
 
 	offset := (page - 1) * perPage
 	query := fmt.Sprintf(`
-		SELECT id, tenant_id, uploader_id, filename, original_name, mime_type,
+		SELECT id, uploader_id, filename, original_name, mime_type,
 			   COALESCE(category, 'news'), COALESCE(folder, 'general'),
 			   file_size, storage_path, COALESCE(alt_text, ''), COALESCE(caption, ''),
 			   COALESCE(width, 0), COALESCE(height, 0), created_at
@@ -287,7 +284,7 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, tenantID int, catego
 	for rows.Next() {
 		var m Media
 		if err := rows.Scan(
-			&m.ID, &m.TenantID, &m.UploaderID, &m.Filename, &m.OriginalName,
+			&m.ID, &m.UploaderID, &m.Filename, &m.OriginalName,
 			&m.MimeType, &m.Category, &m.Folder, &m.FileSize, &m.StoragePath,
 			&m.AltText, &m.Caption, &m.Width, &m.Height, &m.CreatedAt,
 		); err != nil {

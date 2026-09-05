@@ -40,9 +40,9 @@ type AuthorSpotlight struct {
 }
 
 // GetHomeFeed aggregates all essential homepage news blocks in a single, lightning-fast call.
-func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, language, districtSlug string) (*HomeFeedResponse, error) {
+func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, language, districtSlug string) (*HomeFeedResponse, error) {
 	if language == "" {
-		language = "en"
+		language = "hi"
 	}
 
 	resp := &HomeFeedResponse{
@@ -66,7 +66,7 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 	}
 
 	// 2. Navigation Categories
-	categories, err := s.ListCategories(ctx, tx, tenantID)
+	categories, err := s.ListCategories(ctx, tx)
 	if err == nil {
 		resp.NavigationCategories = categories
 	} else {
@@ -78,7 +78,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 3. Breaking News (limit 5)
 	breakingFilter := ListArticlesFilter{
-		TenantID: tenantID,
 		Language: language,
 		Status:   "published",
 		PerPage:  5,
@@ -96,7 +95,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 4. Featured Spotlight (limit 4) - Deduplicated
 	featuredFilter := ListArticlesFilter{
-		TenantID: tenantID,
 		Language: language,
 		Status:   "published",
 		PerPage:  8,
@@ -115,9 +113,8 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 		}
 	}
 
-	// 5. State / Regional News (prioritizes local tenant articles) - Deduplicated
+	// 5. State / Regional News - Deduplicated
 	stateFilter := ListArticlesFilter{
-		TenantID:     tenantID,
 		Language:     language,
 		DistrictSlug: districtSlug,
 		Status:       "published",
@@ -137,7 +134,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 6. Latest Stream (limit 12) - Deduplicated
 	latestFilter := ListArticlesFilter{
-		TenantID: 1,
 		Language: language,
 		Status:   "published",
 		SortBy:   "latest",
@@ -157,7 +153,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 7. Trending News (limit 5) - Deduplicated
 	trendingFilter := ListArticlesFilter{
-		TenantID: 1,
 		Language: language,
 		Status:   "published",
 		SortBy:   "trending",
@@ -180,7 +175,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 
 	// 8. Recommendations - Deduplicated
 	recFilter := ListArticlesFilter{
-		TenantID: 1,
 		Language: language,
 		Status:   "published",
 		PerPage:  12,
@@ -204,7 +198,6 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 	targetCats := []string{"politics", "business", "technology", "sports", "entertainment", "health", "crime"}
 	for _, cat := range targetCats {
 		catFilter := ListArticlesFilter{
-			TenantID: tenantID,
 			Language: language,
 			Category: cat,
 			Status:   "published",
@@ -257,14 +250,14 @@ func (s *Service) GetHomeFeed(ctx context.Context, tx pgx.Tx, tenantID int, lang
 }
 
 // GetHomeFeedDirect uses the connection pool directly (no transaction required).
-func (s *Service) GetHomeFeedDirect(ctx context.Context, tenantID int, language, districtSlug string) (*HomeFeedResponse, error) {
+func (s *Service) GetHomeFeedDirect(ctx context.Context, language, districtSlug string) (*HomeFeedResponse, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	return s.GetHomeFeed(ctx, tx, tenantID, language, districtSlug)
+	return s.GetHomeFeed(ctx, tx, language, districtSlug)
 }
 
 // ─── Safe optional table loaders (recover from missing tables) ─────

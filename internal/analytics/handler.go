@@ -3,7 +3,6 @@ package analytics
 import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
-	"newsplatform/api/pkg/middleware"
 	"newsplatform/api/pkg/response"
 )
 
@@ -23,14 +22,8 @@ func (h *Handler) RegisterAdminRoutes(router fiber.Router) {
 
 func (h *Handler) GetOverview(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
 
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
-
-	overview, err := h.service.GetOverview(c.Context(), tx, tenantID)
+	overview, err := h.service.GetOverview(c.Context(), tx)
 	if err != nil {
 		return response.InternalError(c, "Failed to get analytics overview: "+err.Error())
 	}

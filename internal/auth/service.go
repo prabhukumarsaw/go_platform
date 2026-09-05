@@ -158,14 +158,14 @@ func (s *Service) LoginWithEmail(ctx context.Context, input LoginInput) (*TokenP
 		return nil, nil, fmt.Errorf("invalid credentials")
 	}
 
-	// Fetch user's tenant mappings and roles for JWT claims
-	roles, activeTenantID, err := s.getUserContext(ctx, tx, user.ID)
+	// Fetch user's roles for JWT claims
+	roles, err := s.getUserRoles(ctx, tx, user.ID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("get user context: %w", err)
+		return nil, nil, fmt.Errorf("get user roles: %w", err)
 	}
 
 	// Generate token pair
-	tokens, err := s.generateTokenPair(ctx, tx, user.ID, activeTenantID, nil, roles, user.IsStaff, user.IsSuperAdmin)
+	tokens, err := s.generateTokenPair(ctx, tx, user.ID, nil, roles, user.IsStaff, user.IsSuperAdmin)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate tokens: %w", err)
 	}
@@ -178,58 +178,6 @@ func (s *Service) LoginWithEmail(ctx context.Context, input LoginInput) (*TokenP
 	}
 
 	return tokens, &user, nil
-}
-
-// ─── Workspace / Tenant Switching ────────────────
-
-// SwitchTenant switches the user's active tenant without full re-authentication.
-func (s *Service) SwitchTenant(ctx context.Context, userID int64, targetTenantID int64) (*TokenPair, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Verify user exists and get staff/superadmin flags
-	var isStaff, isSuperAdmin bool
-	err = tx.QueryRow(ctx, "SELECT is_staff, is_super_admin FROM users WHERE id = $1 AND is_active = TRUE", userID).
-		Scan(&isStaff, &isSuperAdmin)
-	if err != nil {
-		return nil, fmt.Errorf("user not found: %w", err)
-	}
-
-	// Verify user has access to target tenant (or is super_admin)
-	// Fetch staff roles for user
-	rows, err := tx.Query(ctx,
-		`SELECT r.name FROM user_roles ur
-		 JOIN roles r ON r.id = ur.role_id
-		 WHERE ur.user_id = $1 AND ur.is_active = TRUE`,
-		userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("fetch roles: %w", err)
-	}
-	defer rows.Close()
-
-	var roles []string
-	for rows.Next() {
-		var r string
-		if err := rows.Scan(&r); err == nil {
-			roles = append(roles, r)
-		}
-	}
-
-	// Generate fresh token pair with the new active tenant claim
-	tokens, err := s.generateTokenPair(ctx, tx, userID, targetTenantID, nil, roles, isStaff, isSuperAdmin)
-	if err != nil {
-		return nil, fmt.Errorf("generate tokens: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
-
-	return tokens, nil
 }
 
 // ─── TOTP MFA (Mandatory for Employees per §4) ───
@@ -290,8 +238,10 @@ func (s *Service) VerifyTOTP(ctx context.Context, userID int64, passcode string)
 
 // ─── Token management ───────────────────────────
 
+// ─── Token management ───────────────────────────
+
 // generateTokenPair creates a new access + refresh token pair.
-func (s *Service) generateTokenPair(ctx context.Context, tx pgx.Tx, userID, tenantID int64, districtID *int64, roles []string, isStaff, isSuperAdmin bool) (*TokenPair, error) {
+func (s *Service) generateTokenPair(ctx context.Context, tx pgx.Tx, userID int64, districtID *int64, roles []string, isStaff, isSuperAdmin bool) (*TokenPair, error) {
 	now := time.Now()
 
 	// Access token (short-lived)
@@ -303,7 +253,6 @@ func (s *Service) generateTokenPair(ctx context.Context, tx pgx.Tx, userID, tena
 			Issuer:    "newsplatform",
 		},
 		UserID:           userID,
-		ActiveTenantID:   tenantID,
 		ActiveDistrictID: districtID,
 		Roles:            roles,
 		IsStaff:          isStaff,
@@ -383,12 +332,12 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken string) (*Toke
 		return nil, fmt.Errorf("fetch user: %w", err)
 	}
 
-	roles, tenantID, err := s.getUserContext(ctx, tx, userID)
+	roles, err := s.getUserRoles(ctx, tx, userID)
 	if err != nil {
-		return nil, fmt.Errorf("get user context: %w", err)
+		return nil, fmt.Errorf("get user roles: %w", err)
 	}
 
-	tokens, err := s.generateTokenPair(ctx, tx, userID, tenantID, nil, roles, isStaff, isSuperAdmin)
+	tokens, err := s.generateTokenPair(ctx, tx, userID, nil, roles, isStaff, isSuperAdmin)
 	if err != nil {
 		return nil, fmt.Errorf("generate new tokens: %w", err)
 	}
@@ -497,12 +446,12 @@ func (s *Service) VerifyOTP(ctx context.Context, phone, otp string) (*TokenPair,
 		return nil, nil, fmt.Errorf("query user by phone: %w", err)
 	}
 
-	roles, tenantID, err := s.getUserContext(ctx, tx, user.ID)
+	roles, err := s.getUserRoles(ctx, tx, user.ID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	tokens, err := s.generateTokenPair(ctx, tx, user.ID, tenantID, nil, roles, user.IsStaff, user.IsSuperAdmin)
+	tokens, err := s.generateTokenPair(ctx, tx, user.ID, nil, roles, user.IsStaff, user.IsSuperAdmin)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -533,37 +482,29 @@ func (s *Service) GetUserByID(ctx context.Context, userID int64) (*User, error) 
 
 // ─── Helpers ────────────────────────────────────
 
-// getUserContext fetches the user's roles and active tenant.
-func (s *Service) getUserContext(ctx context.Context, tx pgx.Tx, userID int64) (roles []string, tenantID int64, err error) {
-	// Check for saved session context first
-	var savedTenantID *int64
-	tx.QueryRow(ctx, "SELECT active_tenant_id FROM user_session_contexts WHERE user_id = $1", userID).
-		Scan(&savedTenantID)
-
-	// Fetch all staff roles
+// getUserRoles fetches the user's roles.
+func (s *Service) getUserRoles(ctx context.Context, tx pgx.Tx, userID int64) (roles []string, err error) {
 	rows, err := tx.Query(ctx,
-		`SELECT 1 as tenant_id, r.name
+		`SELECT r.name
 		 FROM user_roles ur
 		 JOIN roles r ON r.id = ur.role_id
 		 WHERE ur.user_id = $1 AND ur.is_active = TRUE`,
 		userID,
 	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("fetch roles: %w", err)
+		return nil, fmt.Errorf("fetch roles: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var tid int64
 		var roleName string
-		if err := rows.Scan(&tid, &roleName); err != nil {
-			return nil, 0, err
+		if err := rows.Scan(&roleName); err != nil {
+			return nil, err
 		}
 		roles = append(roles, roleName)
 	}
 
-	tenantID = 1
-	return roles, tenantID, rows.Err()
+	return roles, rows.Err()
 }
 
 // hashPassword hashes a password with Argon2id.

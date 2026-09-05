@@ -17,7 +17,7 @@ type EvalContext struct {
 	DeviceType string // "mobile", "desktop", "tablet"
 }
 
-// evaluateABAC checks all active ABAC policies for a user-tenant pair.
+// evaluateABAC checks all active ABAC policies for a user.
 // Returns true if ALL policies pass (AND-logic).
 // If the user has no ABAC policies, this returns true (no constraints = pass).
 func evaluateABAC(policies []ABACPolicy, evalCtx *EvalContext) bool {

@@ -29,7 +29,6 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 // AdSlot represents an ad placement configuration.
 type AdSlot struct {
 	ID        int       `json:"id"`
-	TenantID  int       `json:"tenant_id"`
 	Name      string    `json:"name"`
 	SlotType  string    `json:"slot_type"`
 	AdUnitID  string    `json:"ad_unit_id"`
@@ -55,9 +54,9 @@ type CreateAdSlotInput struct {
 
 // ─── Ad Slot CRUD ───────────────────────────────
 
-// ListAdSlots returns all ad slots for the current tenant.
+// ListAdSlots returns all ad slots.
 func (s *Service) ListAdSlots(ctx context.Context, tx pgx.Tx) ([]AdSlot, error) {
-	query := `SELECT id, tenant_id, name, slot_type, COALESCE(ad_unit_id, ''), is_active, created_at
+	query := `SELECT id, name, slot_type, COALESCE(ad_unit_id, ''), is_active, created_at
 			  FROM ad_slots ORDER BY name`
 
 	rows, err := tx.Query(ctx, query)
@@ -69,7 +68,7 @@ func (s *Service) ListAdSlots(ctx context.Context, tx pgx.Tx) ([]AdSlot, error) 
 	var slots []AdSlot
 	for rows.Next() {
 		var slot AdSlot
-		if err := rows.Scan(&slot.ID, &slot.TenantID, &slot.Name, &slot.SlotType,
+		if err := rows.Scan(&slot.ID, &slot.Name, &slot.SlotType,
 			&slot.AdUnitID, &slot.IsActive, &slot.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -78,15 +77,15 @@ func (s *Service) ListAdSlots(ctx context.Context, tx pgx.Tx) ([]AdSlot, error) 
 	return slots, rows.Err()
 }
 
-// CreateAdSlot creates a new ad slot for the current tenant.
-func (s *Service) CreateAdSlot(ctx context.Context, tx pgx.Tx, tenantID int, input CreateAdSlotInput) (*AdSlot, error) {
-	query := `INSERT INTO ad_slots (tenant_id, name, slot_type, ad_unit_id)
-			  VALUES ($1, $2, $3, $4)
-			  RETURNING id, tenant_id, name, slot_type, COALESCE(ad_unit_id, ''), is_active, created_at`
+// CreateAdSlot creates a new ad slot.
+func (s *Service) CreateAdSlot(ctx context.Context, tx pgx.Tx, input CreateAdSlotInput) (*AdSlot, error) {
+	query := `INSERT INTO ad_slots (name, slot_type, ad_unit_id)
+			  VALUES ($1, $2, $3)
+			  RETURNING id, name, slot_type, COALESCE(ad_unit_id, ''), is_active, created_at`
 
 	var slot AdSlot
-	err := tx.QueryRow(ctx, query, tenantID, input.Name, input.SlotType, input.AdUnitID).
-		Scan(&slot.ID, &slot.TenantID, &slot.Name, &slot.SlotType, &slot.AdUnitID, &slot.IsActive, &slot.CreatedAt)
+	err := tx.QueryRow(ctx, query, input.Name, input.SlotType, input.AdUnitID).
+		Scan(&slot.ID, &slot.Name, &slot.SlotType, &slot.AdUnitID, &slot.IsActive, &slot.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create ad slot: %w", err)
 	}

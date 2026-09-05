@@ -30,7 +30,6 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 // CanRequest holds all the context needed for a permission check.
 type CanRequest struct {
 	UserID       int64
-	TenantID     int64 // retained for backward compatibility
 	Action       string
 	IsSuperAdmin bool
 	IPAddress    string
@@ -40,7 +39,7 @@ type CanRequest struct {
 }
 
 // Can evaluates whether the user is allowed to perform the given action.
-func (s *Service) Can(ctx context.Context, userID, _ int64, action string) (bool, error) {
+func (s *Service) Can(ctx context.Context, userID int64, action string) (bool, error) {
 	return s.CanWithContext(ctx, CanRequest{
 		UserID: userID,
 		Action: action,

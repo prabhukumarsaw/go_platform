@@ -2,6 +2,7 @@ package content
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -59,6 +60,7 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 
 	// Studio Taxonomy CRUD
 	router.Post("/studio/categories", h.CreateCategory)
+	router.Put("/studio/categories/:id", h.UpdateCategory)
 	router.Delete("/studio/categories/:id", h.DeleteCategory)
 	router.Post("/studio/tags", h.CreateTag)
 	router.Delete("/studio/tags/:id", h.DeleteTag)
@@ -76,17 +78,9 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 func (h *Handler) ListArticles(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 
-	tenantID := 1
-	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	} else if sess := middleware.SessionFromCtx(c); sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
-
 	filter := ListArticlesFilter{
-		TenantID:     tenantID,
 		Status:       "published",
-		Language:     c.Query("language", "en"),
+		Language:     c.Query("language", ""),
 		Category:     c.Query("category"),
 		DistrictSlug: c.Query("district"),
 		Period:       c.Query("period"),
@@ -138,7 +132,7 @@ func (h *Handler) ListBreakingNews(c *fiber.Ctx) error {
 
 	filter := ListArticlesFilter{
 		Status:     "published",
-		Language:   c.Query("language", "en"),
+		Language:   c.Query("language", "hi"),
 		IsBreaking: &isBreaking,
 		Page:       1,
 		PerPage:    c.QueryInt("limit", 10),
@@ -159,7 +153,7 @@ func (h *Handler) ListFeaturedNews(c *fiber.Ctx) error {
 
 	filter := ListArticlesFilter{
 		Status:     "published",
-		Language:   c.Query("language", "en"),
+		Language:   c.Query("language", "hi"),
 		IsFeatured: &isFeatured,
 		Page:       1,
 		PerPage:    c.QueryInt("limit", 6),
@@ -179,7 +173,7 @@ func (h *Handler) ListTrendingNews(c *fiber.Ctx) error {
 
 	filter := ListArticlesFilter{
 		Status:   "published",
-		Language: c.Query("language", "en"),
+		Language: c.Query("language", "hi"),
 		SortBy:   "trending",
 		Page:     1,
 		PerPage:  c.QueryInt("limit", 10),
@@ -197,10 +191,11 @@ func (h *Handler) ListTrendingNews(c *fiber.Ctx) error {
 func (h *Handler) GetArticleBySlug(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 	slug := c.Params("slug")
-	language := c.Query("language", "en")
+	language := c.Query("language", "hi")
 
 	article, err := h.service.GetArticleBySlug(c.Context(), tx, slug, language)
 	if err != nil {
+		fmt.Println("GetArticleBySlug ERR:", err)
 		return response.InternalError(c, "Failed to get article: "+err.Error())
 	}
 	if article == nil {
@@ -210,22 +205,14 @@ func (h *Handler) GetArticleBySlug(c *fiber.Ctx) error {
 	return response.Success(c, article)
 }
 
-// ListCategories returns available categories for the active tenant.
+// ListCategories returns available categories.
 func (h *Handler) ListCategories(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	} else if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	}
-
 	var categories []Category
 	var err error
 	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
-		categories, err = h.service.ListCategories(c.Context(), tx, tenantID)
+		categories, err = h.service.ListCategories(c.Context(), tx)
 	} else {
-		categories, err = h.service.ListCategoriesDirect(c.Context(), tenantID)
+		categories, err = h.service.ListCategoriesDirect(c.Context())
 	}
 
 	if err != nil {
@@ -243,7 +230,7 @@ func (h *Handler) ListCategoriesTree(c *fiber.Ctx) error {
 	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
 		roots, err = h.service.ListCategoriesTree(c.Context(), tx)
 	} else {
-		flat, dErr := h.service.ListCategoriesDirect(c.Context(), 1)
+		flat, dErr := h.service.ListCategoriesDirect(c.Context())
 		if dErr != nil {
 			return response.InternalError(c, "Failed to list categories: "+dErr.Error())
 		}
@@ -297,22 +284,15 @@ func (h *Handler) Search(c *fiber.Ctx) error {
 
 // GetHomeFeed aggregates all essential home blocks in a single, fast response.
 func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
-	tenantID := 1
-	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	} else if sess := middleware.SessionFromCtx(c); sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
-
-	language := c.Query("language", "en")
+	language := c.Query("language", "hi")
 	districtSlug := c.Query("district")
 
 	var homeData *HomeFeedResponse
 	var err error
 	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
-		homeData, err = h.service.GetHomeFeed(c.Context(), tx, tenantID, language, districtSlug)
+		homeData, err = h.service.GetHomeFeed(c.Context(), tx, language, districtSlug)
 	} else {
-		homeData, err = h.service.GetHomeFeedDirect(c.Context(), tenantID, language, districtSlug)
+		homeData, err = h.service.GetHomeFeedDirect(c.Context(), language, districtSlug)
 	}
 	if err != nil {
 		return response.InternalError(c, "Failed to load home feed: "+err.Error())
@@ -326,18 +306,13 @@ func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
 // GetPersonalizedFeed returns user-personalized content.
 func (h *Handler) GetPersonalizedFeed(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
 
 	filter := ListArticlesFilter{
 		Status:   "published",
-		Language: c.Query("language", "en"),
+		Language: c.Query("language", "hi"),
 		SortBy:   "latest",
 		Page:     c.QueryInt("page", 1),
 		PerPage:  c.QueryInt("per_page", 20),
-	}
-
-	if sess != nil && sess.ActiveTenantID > 0 {
-		// Scoped by user active tenant edition
 	}
 
 	articles, total, err := h.service.ListArticles(c.Context(), tx, filter)
@@ -385,7 +360,7 @@ func (h *Handler) CreateArticle(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Valid article title is required")
 	}
 
-	article, err := h.service.CreateArticle(c.Context(), tx, int(sess.ActiveTenantID), sess.UserID, input)
+	article, err := h.service.CreateArticle(c.Context(), tx, sess.UserID, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to create article: "+err.Error())
 	}
@@ -519,7 +494,6 @@ func (h *Handler) GetArticleVersions(c *fiber.Ctx) error {
 // ─── Stories & Live Blogs ───────────────────────
 
 func (h *Handler) CreateStory(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
 	tx := c.Locals("tx").(pgx.Tx)
 
 	var body struct {
@@ -527,7 +501,7 @@ func (h *Handler) CreateStory(c *fiber.Ctx) error {
 	}
 	_ = c.BodyParser(&body)
 
-	storyID, err := h.service.CreateStory(c.Context(), tx, int(sess.ActiveTenantID), body.Slug)
+	storyID, err := h.service.CreateStory(c.Context(), tx, body.Slug)
 	if err != nil {
 		return response.InternalError(c, "Failed to create story: "+err.Error())
 	}
@@ -649,25 +623,42 @@ func (h *Handler) TogglePinLiveBlogEntry(c *fiber.Ctx) error {
 
 func (h *Handler) CreateCategory(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	tenantID := 1
-	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	}
 
-	var body struct {
-		Name string `json:"name"`
-		Slug string `json:"slug"`
-	}
-	if err := c.BodyParser(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+	var input CreateCategoryInput
+	if err := c.BodyParser(&input); err != nil || strings.TrimSpace(input.Name) == "" {
 		return response.BadRequest(c, "Category name is required")
 	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.Slug = strings.TrimSpace(input.Slug)
 
-	cat, err := h.service.CreateCategory(c.Context(), tx, tenantID, strings.TrimSpace(body.Name), strings.TrimSpace(body.Slug))
+	cat, err := h.service.CreateCategory(c.Context(), tx, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to create category: "+err.Error())
 	}
 
 	return response.Created(c, cat)
+}
+
+func (h *Handler) UpdateCategory(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid category ID")
+	}
+
+	var input CreateCategoryInput
+	if err := c.BodyParser(&input); err != nil || strings.TrimSpace(input.Name) == "" {
+		return response.BadRequest(c, "Category name is required")
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.Slug = strings.TrimSpace(input.Slug)
+
+	cat, err := h.service.UpdateCategory(c.Context(), tx, id, input)
+	if err != nil {
+		return response.InternalError(c, "Failed to update category: "+err.Error())
+	}
+
+	return response.Success(c, cat)
 }
 
 func (h *Handler) DeleteCategory(c *fiber.Ctx) error {
@@ -685,20 +676,12 @@ func (h *Handler) DeleteCategory(c *fiber.Ctx) error {
 }
 
 func (h *Handler) ListTags(c *fiber.Ctx) error {
-	sess := middleware.SessionFromCtx(c)
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	} else if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	}
-
 	var tags []Tag
 	var err error
 	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
-		tags, err = h.service.ListTags(c.Context(), tx, tenantID)
+		tags, err = h.service.ListTags(c.Context(), tx)
 	} else {
-		tags, err = h.service.ListTagsDirect(c.Context(), tenantID)
+		tags, err = h.service.ListTagsDirect(c.Context())
 	}
 
 	if err != nil {
@@ -710,10 +693,6 @@ func (h *Handler) ListTags(c *fiber.Ctx) error {
 
 func (h *Handler) CreateTag(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	tenantID := 1
-	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	}
 
 	var body struct {
 		Name string `json:"name"`
@@ -723,7 +702,7 @@ func (h *Handler) CreateTag(c *fiber.Ctx) error {
 		return response.BadRequest(c, "Tag name is required")
 	}
 
-	t, err := h.service.CreateTag(c.Context(), tx, tenantID, strings.TrimSpace(body.Name), strings.TrimSpace(body.Slug))
+	t, err := h.service.CreateTag(c.Context(), tx, strings.TrimSpace(body.Name), strings.TrimSpace(body.Slug))
 	if err != nil {
 		return response.InternalError(c, "Failed to create tag: "+err.Error())
 	}

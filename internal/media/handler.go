@@ -58,7 +58,7 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 
 	media, err := h.service.UploadFile(
 		c.Context(), tx,
-		int(sess.ActiveTenantID), sess.UserID,
+		sess.UserID,
 		file.Filename, mimeType, category, folder, file.Size, src,
 	)
 	if err != nil {
@@ -71,12 +71,6 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 // List returns media files with filtering by category, folder, mimeType, and search.
 func (h *Handler) List(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
-
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
 
 	category := c.Query("category")
 	folder := c.Query("folder")
@@ -85,7 +79,7 @@ func (h *Handler) List(c *fiber.Ctx) error {
 	page := c.QueryInt("page", 1)
 	perPage := c.QueryInt("per_page", 20)
 
-	items, total, err := h.service.ListMedia(c.Context(), tx, tenantID, category, folder, mimeType, search, page, perPage)
+	items, total, err := h.service.ListMedia(c.Context(), tx, category, folder, mimeType, search, page, perPage)
 	if err != nil {
 		return response.InternalError(c, "Failed to list media: "+err.Error())
 	}

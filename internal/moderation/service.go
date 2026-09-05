@@ -163,7 +163,6 @@ func (s *Service) ModerateComment(ctx context.Context, tx pgx.Tx, commentID int6
 type Feedback struct {
 	ID        int64      `json:"id"`
 	UserID    *int64     `json:"user_id,omitempty"`
-	TenantID  int        `json:"tenant_id"`
 	Name      string     `json:"name"`
 	Email     string     `json:"email"`
 	Category  string     `json:"category"`
@@ -181,19 +180,19 @@ type SubmitFeedbackInput struct {
 	Message   string     `json:"message"`
 }
 
-func (s *Service) SubmitFeedback(ctx context.Context, tx pgx.Tx, tenantID int, userID *int64, input SubmitFeedbackInput) (*Feedback, error) {
+func (s *Service) SubmitFeedback(ctx context.Context, tx pgx.Tx, userID *int64, input SubmitFeedbackInput) (*Feedback, error) {
 	if input.Category == "" {
 		input.Category = "general"
 	}
 	query := `
-		INSERT INTO feedbacks (tenant_id, user_id, name, email, category, article_id, message, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
-		RETURNING id, tenant_id, user_id, name, email, category, article_id, message, status, created_at
+		INSERT INTO feedbacks (user_id, name, email, category, article_id, message, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'open')
+		RETURNING id, user_id, name, email, category, article_id, message, status, created_at
 	`
 
 	var fb Feedback
-	err := tx.QueryRow(ctx, query, tenantID, userID, input.Name, input.Email, input.Category, input.ArticleID, input.Message).
-		Scan(&fb.ID, &fb.TenantID, &fb.UserID, &fb.Name, &fb.Email, &fb.Category, &fb.ArticleID, &fb.Message, &fb.Status, &fb.CreatedAt)
+	err := tx.QueryRow(ctx, query, userID, input.Name, input.Email, input.Category, input.ArticleID, input.Message).
+		Scan(&fb.ID, &fb.UserID, &fb.Name, &fb.Email, &fb.Category, &fb.ArticleID, &fb.Message, &fb.Status, &fb.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("submit feedback: %w", err)
 	}
@@ -201,15 +200,15 @@ func (s *Service) SubmitFeedback(ctx context.Context, tx pgx.Tx, tenantID int, u
 	return &fb, nil
 }
 
-func (s *Service) ListFeedbacks(ctx context.Context, tx pgx.Tx, tenantID int, status string) ([]Feedback, error) {
+func (s *Service) ListFeedbacks(ctx context.Context, tx pgx.Tx, status string) ([]Feedback, error) {
 	query := `
-		SELECT id, tenant_id, user_id, name, email, category, article_id, message, status, created_at
+		SELECT id, user_id, name, email, category, article_id, message, status, created_at
 		FROM feedbacks
-		WHERE (tenant_id = $1 OR $1 = 1)
+		WHERE 1=1
 	`
-	args := []interface{}{tenantID}
+	var args []interface{}
 	if status != "" {
-		query += " AND status = $2"
+		query += " AND status = $1"
 		args = append(args, status)
 	}
 	query += " ORDER BY created_at DESC LIMIT 50"
@@ -223,7 +222,7 @@ func (s *Service) ListFeedbacks(ctx context.Context, tx pgx.Tx, tenantID int, st
 	var list []Feedback
 	for rows.Next() {
 		var fb Feedback
-		if err := rows.Scan(&fb.ID, &fb.TenantID, &fb.UserID, &fb.Name, &fb.Email, &fb.Category, &fb.ArticleID, &fb.Message, &fb.Status, &fb.CreatedAt); err == nil {
+		if err := rows.Scan(&fb.ID, &fb.UserID, &fb.Name, &fb.Email, &fb.Category, &fb.ArticleID, &fb.Message, &fb.Status, &fb.CreatedAt); err == nil {
 			list = append(list, fb)
 		}
 	}

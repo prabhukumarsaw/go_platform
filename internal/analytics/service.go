@@ -21,12 +21,12 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 	}
 }
 
-func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, tenantID int) (*AnalyticsOverview, error) {
+func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx) (*AnalyticsOverview, error) {
 	var overview AnalyticsOverview
 
 	// Aggregate counts
-	_ = tx.QueryRow(ctx, "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles").
-		Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalViews, &overview.TotalBreaking)
+	_ = tx.QueryRow(ctx, "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COUNT(*) FILTER (WHERE status='draft'), COUNT(*) FILTER (WHERE status IN ('review', 'approved')), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles").
+		Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalDrafts, &overview.TotalReview, &overview.TotalViews, &overview.TotalBreaking)
 
 	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM newsletter_subscriptions WHERE is_active = TRUE").Scan(&overview.TotalSubscribers)
 

@@ -126,11 +126,6 @@ func (h *Handler) SubmitFeedback(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 	sess := middleware.SessionFromCtx(c)
 
-	tenantID := 1
-	if tid, ok := c.Locals("tenant_id").(int64); ok && tid > 0 {
-		tenantID = int(tid)
-	}
-
 	var input SubmitFeedbackInput
 	if err := c.BodyParser(&input); err != nil || input.Name == "" || input.Email == "" || input.Message == "" {
 		return response.BadRequest(c, "Name, email, and message are required")
@@ -141,7 +136,7 @@ func (h *Handler) SubmitFeedback(c *fiber.Ctx) error {
 		userID = &sess.UserID
 	}
 
-	fb, err := h.service.SubmitFeedback(c.Context(), tx, tenantID, userID, input)
+	fb, err := h.service.SubmitFeedback(c.Context(), tx, userID, input)
 	if err != nil {
 		return response.InternalError(c, "Failed to submit feedback: "+err.Error())
 	}
@@ -152,16 +147,9 @@ func (h *Handler) SubmitFeedback(c *fiber.Ctx) error {
 // ListFeedbacks returns the editorial feedback queue for newsroom review.
 func (h *Handler) ListFeedbacks(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	sess := middleware.SessionFromCtx(c)
-
-	tenantID := 1
-	if sess != nil && sess.ActiveTenantID > 0 {
-		tenantID = int(sess.ActiveTenantID)
-	}
-
 	status := c.Query("status")
 
-	list, err := h.service.ListFeedbacks(c.Context(), tx, tenantID, status)
+	list, err := h.service.ListFeedbacks(c.Context(), tx, status)
 	if err != nil {
 		return response.InternalError(c, "Failed to load feedbacks: "+err.Error())
 	}
