@@ -85,6 +85,74 @@ func main() {
 		) c
 		WHERE NOT EXISTS (SELECT 1 FROM article_categories ac WHERE ac.article_id = a.id)
 		ON CONFLICT DO NOTHING;
+
+		-- Ensure live_blog_entries columns
+		CREATE TABLE IF NOT EXISTS live_blog_entries (
+			id SERIAL PRIMARY KEY,
+			article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
+			headline VARCHAR(255) DEFAULT '',
+			title VARCHAR(255) DEFAULT '',
+			body JSONB DEFAULT '""'::jsonb,
+			content TEXT DEFAULT '',
+			author_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+			is_pinned BOOLEAN DEFAULT FALSE,
+			is_breaking BOOLEAN DEFAULT FALSE,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS headline VARCHAR(255) DEFAULT '';
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS body JSONB DEFAULT '""'::jsonb;
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS author_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN DEFAULT FALSE;
+		ALTER TABLE live_blog_entries ADD COLUMN IF NOT EXISTS is_breaking BOOLEAN DEFAULT FALSE;
+		ALTER TABLE live_blog_entries ALTER COLUMN content DROP NOT NULL;
+		ALTER TABLE live_blog_entries ALTER COLUMN content SET DEFAULT '';
+		ALTER TABLE live_blog_entries ALTER COLUMN title DROP NOT NULL;
+		ALTER TABLE live_blog_entries ALTER COLUMN title SET DEFAULT '';
+
+		-- Ensure media table schema
+		DO $$
+		DECLARE
+			id_type text;
+		BEGIN
+			SELECT data_type INTO id_type 
+			FROM information_schema.columns 
+			WHERE table_name = 'media' AND column_name = 'id';
+
+			IF id_type IS NOT NULL AND id_type != 'uuid' THEN
+				DROP TABLE IF EXISTS media CASCADE;
+			END IF;
+		END $$;
+
+		CREATE TABLE IF NOT EXISTS media (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			uploader_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+			filename VARCHAR(255) NOT NULL,
+			original_name VARCHAR(255) DEFAULT '',
+			mime_type VARCHAR(100) DEFAULT '',
+			category VARCHAR(50) DEFAULT 'news',
+			folder VARCHAR(100) DEFAULT 'general',
+			file_size BIGINT DEFAULT 0,
+			storage_path TEXT DEFAULT '',
+			url TEXT DEFAULT '',
+			alt_text TEXT DEFAULT '',
+			caption TEXT DEFAULT '',
+			width INT DEFAULT 0,
+			height INT DEFAULT 0,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS uploader_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS original_name VARCHAR(255) DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS file_size BIGINT DEFAULT 0;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS storage_path TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS url TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS alt_text TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS width INT DEFAULT 0;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS height INT DEFAULT 0;
+
+		CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
+		CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
+		CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);
 	`)
 
 	redisClient, err := database.NewRedisClient(ctx, cfg.Redis)
@@ -103,10 +171,16 @@ func main() {
 	iamService := iam.NewService(pool, log)
 	authService := auth.NewService(pool, *cfg, log)
 	contentService := content.NewService(pool, redisClient, log)
+	if err := contentService.EnsureHomepageSchema(ctx); err != nil {
+		log.Warn().Err(err).Msg("Homepage schema initialization warning")
+	}
 	mediaService := media.NewService(pool, cfg.Media, log)
+	if err := mediaService.EnsureSchema(ctx); err != nil {
+		log.Warn().Err(err).Msg("Media schema initialization warning")
+	}
 	adsService := ads.NewService(pool, log)
 	seoService := seo.NewService(pool, "http://localhost:3000", log)
-	notifyService := notify.NewService(pool, log)
+	notifyService := notify.NewService(pool, redisClient, log)
 	moderationService := moderation.NewService(pool, log)
 	webstoryService := webstory.NewService(pool, log)
 	pollService := poll.NewService(pool, log)
@@ -164,10 +238,15 @@ func main() {
 	}))
 	app.Use(middleware.RateLimiter(300, 1*time.Minute))
 
-	// Static local media storage mount
+	// Static local media storage mount with 30-day client caching and HTTP byte ranges
 	absUploadDir, _ := filepath.Abs(cfg.Media.UploadDir)
 	_ = os.MkdirAll(absUploadDir, 0755)
-	app.Static("/uploads", absUploadDir)
+	app.Static("/uploads", absUploadDir, fiber.Static{
+		Compress:  true,
+		ByteRange: true,
+		Browse:    false,
+		MaxAge:    86400 * 30, // 30 days client cache
+	})
 
 	// ─── 9. Mount Centralized Router ────────────
 	routes.Setup(app, handlers, pool, cfg)

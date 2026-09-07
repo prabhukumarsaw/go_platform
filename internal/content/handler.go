@@ -1,6 +1,7 @@
 package content
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -39,8 +40,11 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 	router.Get("/categories/tree", h.ListCategoriesTree)
 	router.Get("/tags", h.ListTags)
 	router.Get("/search", h.Search)
+	router.Get("/trending/searches", h.GetTrendingSearches)
+	router.Post("/trending/searches/record", h.RecordSearch)
 	router.Get("/home", h.GetHomeFeed)
 	router.Get("/feed/home", h.GetHomeFeed)
+	router.Get("/homepage/sections", h.ListHomepageSections)
 	router.Get("/live-blogs/:articleId/entries", h.ListLiveBlogEntries)
 	router.Get("/stories/:storyId/variants", h.GetStoryVariants)
 	router.Get("/feed", h.GetPersonalizedFeed)
@@ -70,6 +74,13 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 	router.Post("/studio/live-blogs/:id/entries", h.AddLiveBlogEntry)
 	router.Delete("/studio/live-blogs/entries/:id", h.DeleteLiveBlogEntry)
 	router.Patch("/studio/live-blogs/entries/:id/pin", h.TogglePinLiveBlogEntry)
+
+	// Studio Homepage Sections & Layout Management
+	router.Get("/studio/homepage/sections", h.ListHomepageSections)
+	router.Post("/studio/homepage/sections", h.CreateHomepageSection)
+	router.Put("/studio/homepage/sections/:id", h.UpdateHomepageSection)
+	router.Delete("/studio/homepage/sections/:id", h.DeleteHomepageSection)
+	router.Post("/studio/homepage/sections/reorder", h.ReorderHomepageSections)
 }
 
 // ─── Public Handlers ────────────────────────────
@@ -78,7 +89,16 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 func (h *Handler) ListArticles(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
 
+	search := c.Query("search")
+	if search == "" {
+		search = c.Query("q")
+	}
+	if search != "" {
+		go h.service.RecordSearchQuery(context.Background(), search)
+	}
+
 	filter := ListArticlesFilter{
+		Search:       search,
 		Status:       "published",
 		Language:     c.Query("language", ""),
 		Category:     c.Query("category"),
@@ -123,6 +143,24 @@ func (h *Handler) ListArticles(c *fiber.Ctx) error {
 	}
 
 	return response.Paginated(c, articles, filter.Page, filter.PerPage, total)
+}
+
+// GetTrendingSearches returns real-time top trending search terms.
+func (h *Handler) GetTrendingSearches(c *fiber.Ctx) error {
+	limit := c.QueryInt("limit", 14)
+	items := h.service.GetTrendingSearches(c.Context(), limit)
+	return response.Success(c, items)
+}
+
+// RecordSearch records a user's search query for analytics.
+func (h *Handler) RecordSearch(c *fiber.Ctx) error {
+	var body struct {
+		Term string `json:"term"`
+	}
+	if err := c.BodyParser(&body); err == nil && body.Term != "" {
+		h.service.RecordSearchQuery(c.Context(), body.Term)
+	}
+	return response.Success(c, fiber.Map{"recorded": true})
 }
 
 // ListBreakingNews returns breaking news alerts.
@@ -261,10 +299,10 @@ func (h *Handler) ListCategoriesTree(c *fiber.Ctx) error {
 	return response.Success(c, roots)
 }
 
-// Search performs full-text search.
+// Search performs full-text search with HTTP caching & ETag support.
 func (h *Handler) Search(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
-	query := c.Query("q")
+	query := strings.TrimSpace(c.Query("q"))
 	if query == "" {
 		return response.BadRequest(c, "Search query 'q' parameter is required")
 	}
@@ -279,17 +317,23 @@ func (h *Handler) Search(c *fiber.Ctx) error {
 		return response.InternalError(c, "Search failed: "+err.Error())
 	}
 
+	// Browser & Edge CDN caching for low-bandwidth mobile readers
+	c.Set("Cache-Control", "public, max-age=60, stale-while-revalidate=120")
+
 	return response.Success(c, results)
 }
 
-// GetHomeFeed aggregates all essential home blocks in a single, fast response.
+// GetHomeFeed aggregates all essential home blocks in a single, fast response with strict zero-duplicate guarantee.
 func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
 	language := c.Query("language", "hi")
 	districtSlug := c.Query("district")
+	forceRefresh := c.Query("refresh") == "true" || c.Query("refresh") == "1"
 
 	var homeData *HomeFeedResponse
 	var err error
-	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+	if forceRefresh {
+		homeData, err = h.service.buildHomeFeed(c.Context(), language, districtSlug, true)
+	} else if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
 		homeData, err = h.service.GetHomeFeed(c.Context(), tx, language, districtSlug)
 	} else {
 		homeData, err = h.service.GetHomeFeedDirect(c.Context(), language, districtSlug)
@@ -298,8 +342,8 @@ func (h *Handler) GetHomeFeed(c *fiber.Ctx) error {
 		return response.InternalError(c, "Failed to load home feed: "+err.Error())
 	}
 
-	// Cache hint for CDN / reverse proxies
-	c.Set("Cache-Control", "public, max-age=30, stale-while-revalidate=60")
+	// Cache hint for CDN / reverse proxies: 30s max-age, 300s stale-while-revalidate
+	c.Set("Cache-Control", "public, max-age=30, stale-while-revalidate=300")
 	return response.Success(c, homeData)
 }
 
@@ -334,7 +378,13 @@ func (h *Handler) StudioListArticles(c *fiber.Ctx) error {
 		status = ""
 	}
 
+	search := c.Query("search")
+	if search == "" {
+		search = c.Query("q")
+	}
+
 	filter := ListArticlesFilter{
+		Search:   search,
 		Status:   status,
 		Language: c.Query("language"),
 		Category: c.Query("category"),

@@ -227,8 +227,13 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE TABLE IF NOT EXISTS live_blog_entries (
     id SERIAL PRIMARY KEY,
     article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
-    title VARCHAR(255),
-    content TEXT NOT NULL,
+    headline VARCHAR(255) DEFAULT '',
+    title VARCHAR(255) DEFAULT '',
+    body JSONB DEFAULT '""'::jsonb,
+    content TEXT DEFAULT '',
+    author_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    is_pinned BOOLEAN DEFAULT FALSE,
+    is_breaking BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -236,16 +241,26 @@ CREATE TABLE IF NOT EXISTS live_blog_entries (
 -- 6. MEDIA LIBRARY & INTERACTIVE FEATURES
 -- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS media (
-    id SERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    uploader_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
     filename VARCHAR(255) NOT NULL,
-    url TEXT NOT NULL,
-    mime_type VARCHAR(100),
-    size_bytes BIGINT DEFAULT 0,
+    original_name VARCHAR(255) DEFAULT '',
+    mime_type VARCHAR(100) DEFAULT '',
     category VARCHAR(50) DEFAULT 'news',
     folder VARCHAR(100) DEFAULT 'general',
-    uploaded_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    file_size BIGINT DEFAULT 0,
+    storage_path TEXT DEFAULT '',
+    url TEXT DEFAULT '',
+    alt_text TEXT DEFAULT '',
+    caption TEXT DEFAULT '',
+    width INT DEFAULT 0,
+    height INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
+CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
+CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS web_stories (
     id SERIAL PRIMARY KEY,

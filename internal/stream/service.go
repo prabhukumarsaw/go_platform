@@ -60,9 +60,10 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 // StreamBreakingNews streams breaking news alerts to clients via Server-Sent Events.
 func (h *Handler) StreamBreakingNews(c *fiber.Ctx) error {
 	c.Set("Content-Type", "text/event-stream")
-	c.Set("Cache-Control", "no-cache")
+	c.Set("Cache-Control", "no-cache, no-transform")
 	c.Set("Connection", "keep-alive")
 	c.Set("Transfer-Encoding", "chunked")
+	c.Set("X-Accel-Buffering", "no")
 
 	pubsub := h.service.redis.Subscribe(c.Context(), "stream:breaking_news")
 
@@ -107,9 +108,10 @@ func (h *Handler) StreamLiveBlog(c *fiber.Ctx) error {
 	}
 
 	c.Set("Content-Type", "text/event-stream")
-	c.Set("Cache-Control", "no-cache")
+	c.Set("Cache-Control", "no-cache, no-transform")
 	c.Set("Connection", "keep-alive")
 	c.Set("Transfer-Encoding", "chunked")
+	c.Set("X-Accel-Buffering", "no")
 
 	pubsub := h.service.redis.Subscribe(c.Context(), "stream:live_blog:"+articleID)
 

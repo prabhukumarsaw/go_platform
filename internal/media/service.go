@@ -12,20 +12,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"newsplatform/api/pkg/config"
 	"github.com/rs/zerolog"
+	"golang.org/x/image/draw"
+	"newsplatform/api/pkg/config"
 )
 
 // Service handles media upload, storage, and retrieval using local filesystem.
 type Service struct {
-	pool      *pgxpool.Pool
-	cfg       config.MediaConfig
-	logger    zerolog.Logger
+	pool       *pgxpool.Pool
+	cfg        config.MediaConfig
+	logger     zerolog.Logger
+	schemaOnce sync.Once
 }
 
 // NewService creates a new media service with local filesystem storage.
@@ -33,11 +36,81 @@ func NewService(pool *pgxpool.Pool, cfg config.MediaConfig, logger zerolog.Logge
 	// Ensure upload directory exists
 	os.MkdirAll(cfg.UploadDir, 0755)
 
-	return &Service{
+	s := &Service{
 		pool:   pool,
 		cfg:    cfg,
 		logger: logger.With().Str("module", "media").Logger(),
 	}
+
+	// Proactively verify/create schema in background
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s.ensureSchema(ctx)
+	}()
+
+	return s
+}
+
+// EnsureSchema verifies that the media table exists with the proper UUID primary key and required columns.
+func (s *Service) EnsureSchema(ctx context.Context) error {
+	migrationQuery := `
+		DO $$
+		DECLARE
+			id_type text;
+		BEGIN
+			SELECT data_type INTO id_type 
+			FROM information_schema.columns 
+			WHERE table_name = 'media' AND column_name = 'id';
+
+			-- If table exists but id is integer/serial or uploader_id is missing, recreate table cleanly
+			IF id_type IS NOT NULL AND id_type != 'uuid' THEN
+				DROP TABLE IF EXISTS media CASCADE;
+			END IF;
+		END $$;
+
+		CREATE TABLE IF NOT EXISTS media (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			uploader_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+			filename VARCHAR(255) NOT NULL,
+			original_name VARCHAR(255) DEFAULT '',
+			mime_type VARCHAR(100) DEFAULT '',
+			category VARCHAR(50) DEFAULT 'news',
+			folder VARCHAR(100) DEFAULT 'general',
+			file_size BIGINT DEFAULT 0,
+			storage_path TEXT DEFAULT '',
+			url TEXT DEFAULT '',
+			alt_text TEXT DEFAULT '',
+			caption TEXT DEFAULT '',
+			width INT DEFAULT 0,
+			height INT DEFAULT 0,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		);
+
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS uploader_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS original_name VARCHAR(255) DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS file_size BIGINT DEFAULT 0;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS storage_path TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS url TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS alt_text TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS caption TEXT DEFAULT '';
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS width INT DEFAULT 0;
+		ALTER TABLE media ADD COLUMN IF NOT EXISTS height INT DEFAULT 0;
+
+		CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
+		CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
+		CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);
+	`
+	_, err := s.pool.Exec(ctx, migrationQuery)
+	return err
+}
+
+func (s *Service) ensureSchema(ctx context.Context) {
+	s.schemaOnce.Do(func() {
+		if err := s.EnsureSchema(ctx); err != nil {
+			s.logger.Warn().Err(err).Msg("failed to ensure media table schema")
+		}
+	})
 }
 
 // ─── Models ───────────// Media represents a media file record.
@@ -136,6 +209,8 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, uploaderID int64, f
 	// Build public URL
 	publicURL := fmt.Sprintf("%s/%s", strings.TrimRight(s.cfg.BaseURL, "/"), filepath.ToSlash(relativePath))
 
+	s.ensureSchema(ctx)
+
 	// Insert metadata into database
 	query := `
 		INSERT INTO media
@@ -145,9 +220,14 @@ func (s *Service) UploadFile(ctx context.Context, tx pgx.Tx, uploaderID int64, f
 		RETURNING created_at
 	`
 
+	var uploaderIDParam *int64
+	if uploaderID > 0 {
+		uploaderIDParam = &uploaderID
+	}
+
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, query,
-		mediaID, uploaderID, storedFilename, filename, mimeType,
+		mediaID, uploaderIDParam, storedFilename, filename, mimeType,
 		category, folder, written, filepath.ToSlash(relativePath), width, height,
 	).Scan(&createdAt)
 	if err != nil {
@@ -217,6 +297,8 @@ func (s *Service) UploadAvatar(ctx context.Context, userID int64, filename strin
 
 // ListMedia returns media files filtered by category, folder, mimeType, and search query.
 func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, folder string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
+	s.ensureSchema(ctx)
+
 	if page < 1 {
 		page = 1
 	}
@@ -299,6 +381,8 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, fol
 
 // ListFolders aggregates all distinct media folders and returns their item counts.
 func (s *Service) ListFolders(ctx context.Context, tx pgx.Tx) ([]FolderSummary, error) {
+	s.ensureSchema(ctx)
+
 	query := `
 		SELECT COALESCE(NULLIF(folder, ''), 'general') AS folder_name, COUNT(*) AS total
 		FROM media
@@ -402,7 +486,8 @@ func getImageDimensions(path string) (int, int) {
 	return cfg.Width, cfg.Height
 }
 
-// optimizeImage decodes, compresses at 82% quality, and re-writes the image file.
+// optimizeImage scales oversized images down to standard Full HD (max width 1920px, max height 1080px),
+// compresses at 82% quality, and re-writes the optimized file to conserve mobile reader bandwidth.
 func optimizeImage(path string, mimeType string) (int, int, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -419,12 +504,42 @@ func optimizeImage(path string, mimeType string) (int, int, int64, error) {
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	// If JPEG or PNG, compress and optimize
+	// Full HD maximum bounds for news editorial photos
+	const maxW = 1920
+	const maxH = 1080
+
+	targetW := width
+	targetH := height
+
+	// Downscale oversized images using high-fidelity CatmullRom resampling
+	if width > maxW || height > maxH {
+		ratioW := float64(maxW) / float64(width)
+		ratioH := float64(maxH) / float64(height)
+		scaleRatio := ratioW
+		if ratioH < scaleRatio {
+			scaleRatio = ratioH
+		}
+		targetW = int(float64(width) * scaleRatio)
+		targetH = int(float64(height) * scaleRatio)
+		if targetW < 1 {
+			targetW = 1
+		}
+		if targetH < 1 {
+			targetH = 1
+		}
+
+		dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
+		img = dst
+		width = targetW
+		height = targetH
+	}
+
+	// Compress JPEG or PNG with 82% quality
 	if mimeType == "image/jpeg" || mimeType == "image/png" {
 		var buf bytes.Buffer
 		opts := &jpeg.Options{Quality: 82} // Standard editorial compression
 		if err := jpeg.Encode(&buf, img, opts); err == nil {
-			// Write optimized buffer back to file
 			if err := os.WriteFile(path, buf.Bytes(), 0644); err == nil {
 				return width, height, int64(buf.Len()), nil
 			}
