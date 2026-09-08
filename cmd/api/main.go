@@ -153,6 +153,154 @@ func main() {
 		CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
 		CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
 		CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);
+
+		-- Ensure employees table exists for staff management
+		CREATE TABLE IF NOT EXISTS employees (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			employee_code VARCHAR(100) UNIQUE NOT NULL,
+			department VARCHAR(100) DEFAULT 'Editorial',
+			designation VARCHAR(200) DEFAULT '',
+			address TEXT DEFAULT '',
+			pin_code VARCHAR(20) DEFAULT '',
+			bio TEXT DEFAULT '',
+			press_card_no VARCHAR(100) DEFAULT '',
+			x_handle VARCHAR(100) DEFAULT '',
+			facebook VARCHAR(200) DEFAULT '',
+			instagram VARCHAR(200) DEFAULT '',
+			youtube VARCHAR(200) DEFAULT '',
+			is_active BOOLEAN DEFAULT TRUE,
+			joined_at TIMESTAMPTZ DEFAULT NOW(),
+			created_at TIMESTAMPTZ DEFAULT NOW(),
+			updated_at TIMESTAMPTZ DEFAULT NOW()
+		);
+		ALTER TABLE employees ADD COLUMN IF NOT EXISTS facebook VARCHAR(200) DEFAULT '';
+		ALTER TABLE employees ADD COLUMN IF NOT EXISTS instagram VARCHAR(200) DEFAULT '';
+		ALTER TABLE employees ADD COLUMN IF NOT EXISTS youtube VARCHAR(200) DEFAULT '';
+	`)
+
+	// ─── Schema Migration: IAM tables (always run independently) ──────────────
+	schemaAlters := []string{
+		// roles table
+		`ALTER TABLE roles ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE NOT NULL`,
+		`ALTER TABLE roles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NULL`,
+		// menus table
+		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS icon VARCHAR(100) DEFAULT ''`,
+		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES menus(id) ON DELETE SET NULL`,
+		// menu_actions table
+		`ALTER TABLE menu_actions ADD COLUMN IF NOT EXISTS label VARCHAR(150) DEFAULT ''`,
+		// permission_audit_log table
+		`CREATE TABLE IF NOT EXISTS permission_audit_log (
+			id              BIGSERIAL PRIMARY KEY,
+			user_id         BIGINT NOT NULL,
+			menu_action_id  INT,
+			action_name     VARCHAR(80),
+			decision        VARCHAR(20) NOT NULL,
+			reason          TEXT,
+			ip_address      INET,
+			user_agent      TEXT,
+			request_id      VARCHAR(100),
+			created_at      TIMESTAMPTZ DEFAULT NOW()
+		)`,
+		// Auto-enroll superadmin and staff into employees if missing
+		`INSERT INTO employees (user_id, employee_code, department, designation, bio, press_card_no, is_active)
+		SELECT u.id,
+		       'EMP-' || LPAD(u.id::text, 4, '0'),
+		       'Editorial',
+		       CASE WHEN u.is_super_admin THEN 'Chief Editor' ELSE 'Staff Member' END,
+		       CASE WHEN u.is_super_admin THEN 'Platform Chief Editor & Root Administrator' ELSE 'Newsroom staff member' END,
+		       CASE WHEN u.is_super_admin THEN 'PRESS-CHIEF-01' ELSE 'PRESS-' || LPAD(u.id::text, 4, '0') END,
+		       TRUE
+		FROM users u
+		WHERE (u.is_staff = TRUE OR u.is_super_admin = TRUE)
+		  AND NOT EXISTS (SELECT 1 FROM employees e WHERE e.user_id = u.id)
+		ON CONFLICT (user_id) DO NOTHING`,
+	}
+	for _, q := range schemaAlters {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			log.Warn().Err(err).Str("query", q).Msg("Schema alter skipped (may already exist)")
+		}
+	}
+
+	// ─── IAM Seed: ensure menus, roles, actions & grants exist ───────────────
+	_, _ = pool.Exec(ctx, `
+		-- Ensure all active newsroom menus exist
+		INSERT INTO menus (name, label, icon, path, sort_order, is_active) VALUES
+			('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE),
+			('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE),
+			('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE),
+			('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE),
+			('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE),
+			('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE),
+			('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE),
+			('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE),
+			('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE),
+			('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE),
+			('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE),
+			('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE),
+			('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE),
+			('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE),
+			('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE),
+			('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE)
+		ON CONFLICT (name) DO UPDATE SET
+			label      = EXCLUDED.label,
+			icon       = EXCLUDED.icon,
+			path       = EXCLUDED.path,
+			sort_order = EXCLUDED.sort_order,
+			is_active  = EXCLUDED.is_active;
+
+		-- Deactivate obsolete/duplicate menus
+		UPDATE menus SET is_active = FALSE WHERE name IN ('employees', 'polls', 'moderation', 'ads', 'web_stories', 'e_paper');
+
+		-- Generate actions for all menus
+		DO $$
+		DECLARE
+			m RECORD;
+			actions TEXT[] := ARRAY['VIEW','ADD','EDIT','DELETE','PUBLISH','APPROVE'];
+			act TEXT;
+		BEGIN
+			FOR m IN SELECT id FROM menus LOOP
+				FOREACH act IN ARRAY actions LOOP
+					INSERT INTO menu_actions (menu_id, action) VALUES (m.id, act) ON CONFLICT DO NOTHING;
+				END LOOP;
+			END LOOP;
+		END $$;
+
+		-- Ensure system roles exist
+		INSERT INTO roles (name, description, is_system, is_active) VALUES
+			('super_admin', 'Full platform-wide root authority',           TRUE, TRUE),
+			('editor',      'Editorial publishing and review authority',   TRUE, TRUE),
+			('sub_editor',  'Content review and editing desk',             TRUE, TRUE),
+			('reporter',    'Field journalism and draft creation',         TRUE, TRUE),
+			('moderator',   'Community and comment moderation authority',  TRUE, TRUE)
+		ON CONFLICT (name) DO UPDATE SET is_active = TRUE;
+
+		-- Grant ALL permissions to super_admin
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r CROSS JOIN menu_actions ma WHERE r.name = 'super_admin'
+		ON CONFLICT DO NOTHING;
+
+		-- Grant VIEW+ADD+EDIT+PUBLISH to editor
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r
+		JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT','PUBLISH')
+		WHERE r.name = 'editor'
+		ON CONFLICT DO NOTHING;
+
+		-- Grant VIEW+ADD+EDIT to reporter
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r
+		JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+		WHERE r.name = 'reporter'
+		ON CONFLICT DO NOTHING;
+
+		-- Grant VIEW+APPROVE+DELETE on comments/moderation to moderator
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r
+		JOIN menu_actions ma ON ma.action IN ('VIEW','APPROVE','DELETE')
+		JOIN menus m ON m.id = ma.menu_id AND m.name IN ('comments','moderation','articles')
+		WHERE r.name = 'moderator'
+		ON CONFLICT DO NOTHING;
 	`)
 
 	redisClient, err := database.NewRedisClient(ctx, cfg.Redis)

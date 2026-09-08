@@ -54,13 +54,13 @@ func (r *Repository) ListEmployees(ctx context.Context, tx pgx.Tx, department, s
 	var args []interface{}
 	argIdx := 1
 
-	if department != "" {
+	if department != "" && department != "all" {
 		query += fmt.Sprintf(" AND e.department = $%d", argIdx)
 		args = append(args, department)
 		argIdx++
 	}
 
-	if search != "" {
+	if search != "" && search != "all" {
 		s := "%" + strings.TrimSpace(search) + "%"
 		query += fmt.Sprintf(" AND (u.display_name ILIKE $%d OR u.email ILIKE $%d OR e.employee_code ILIKE $%d)", argIdx, argIdx, argIdx)
 		args = append(args, s)

@@ -130,6 +130,7 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 	h.WebStory.RegisterStudioRoutes(staffRoutes)
 	h.EPaper.RegisterStudioRoutes(staffRoutes)
 	h.AI.RegisterStudioRoutes(staffRoutes)
+	h.Moderation.RegisterAdminRoutes(staffRoutes) // Also register moderation at /moderation/... (not only /admin/moderation/...)
 
 	// ─── 4. Admin & Governance Routes ───────────────
 	adminRoutes := staffRoutes.Group("/admin")

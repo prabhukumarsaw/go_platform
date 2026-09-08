@@ -8,11 +8,12 @@ import (
 	"strings"
 	"time"
 
+	"newsplatform/api/pkg/middleware"
+	"newsplatform/api/pkg/response"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"newsplatform/api/pkg/middleware"
-	"newsplatform/api/pkg/response"
 )
 
 // Handler exposes HTTP endpoints for articles and content.
@@ -48,6 +49,7 @@ func (h *Handler) RegisterPublicRoutes(router fiber.Router) {
 	router.Get("/live-blogs/:articleId/entries", h.ListLiveBlogEntries)
 	router.Get("/stories/:storyId/variants", h.GetStoryVariants)
 	router.Get("/feed", h.GetPersonalizedFeed)
+	router.Get("/authors/:id", h.GetAuthorProfile)
 }
 
 // RegisterStudioRoutes registers staff studio routes.
@@ -241,6 +243,68 @@ func (h *Handler) GetArticleBySlug(c *fiber.Ctx) error {
 	}
 
 	return response.Success(c, article)
+}
+
+// GetAuthorProfile returns public author profile details, bio, and stats.
+func (h *Handler) GetAuthorProfile(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	authorID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return response.BadRequest(c, "Invalid author ID")
+	}
+
+	query := `
+		SELECT u.id,
+		       COALESCE(u.display_name, 'Journalist') as name,
+		       COALESCE(u.avatar_url, '') as avatar_url,
+		       COALESCE(e.designation, 'Platform Senior Journalist') as designation,
+		       COALESCE(e.department, 'Editorial Bureau') as department,
+		       COALESCE(NULLIF(e.bio, ''), 'Senior investigative correspondent tracking governance, legal developments, law enforcement, and regional affairs.') as bio,
+		       COALESCE(e.x_handle, '') as x_handle,
+		       COALESCE(ac.count, 0) as article_count,
+		       COALESCE(vc.views, 0) as total_views,
+		       u.created_at
+		FROM users u
+		LEFT JOIN employees e ON e.user_id = u.id
+		LEFT JOIN (
+			SELECT author_id, COUNT(*) as count FROM articles WHERE status = 'published' GROUP BY author_id
+		) ac ON ac.author_id = u.id
+		LEFT JOIN (
+			SELECT author_id, SUM(view_count) as views FROM articles WHERE status = 'published' GROUP BY author_id
+		) vc ON vc.author_id = u.id
+		WHERE u.id = $1
+	`
+
+	var profile struct {
+		ID           int64     `json:"id"`
+		Name         string    `json:"name"`
+		AvatarURL    string    `json:"avatar_url"`
+		Designation  string    `json:"designation"`
+		Department   string    `json:"department"`
+		Bio          string    `json:"bio"`
+		XHandle      string    `json:"x_handle"`
+		ArticleCount int64     `json:"article_count"`
+		TotalViews   int64     `json:"total_views"`
+		CreatedAt    time.Time `json:"created_at"`
+	}
+
+	err = tx.QueryRow(c.Context(), query, authorID).Scan(
+		&profile.ID,
+		&profile.Name,
+		&profile.AvatarURL,
+		&profile.Designation,
+		&profile.Department,
+		&profile.Bio,
+		&profile.XHandle,
+		&profile.ArticleCount,
+		&profile.TotalViews,
+		&profile.CreatedAt,
+	)
+	if err != nil {
+		return response.NotFound(c, "Author not found")
+	}
+
+	return response.Success(c, profile)
 }
 
 // ListCategories returns available categories.

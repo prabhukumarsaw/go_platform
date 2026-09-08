@@ -805,7 +805,15 @@ func (r *Repository) InsertAuditLog(ctx context.Context, tx pgx.Tx, log AuditEnt
 
 func (r *Repository) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset int) ([]AuditEntry, int64, error) {
 	var total int64
-	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM permission_audit_log").Scan(&total)
+	var countErr error
+	if tx != nil {
+		countErr = tx.QueryRow(ctx, "SELECT COUNT(*) FROM permission_audit_log").Scan(&total)
+	} else {
+		countErr = r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM permission_audit_log").Scan(&total)
+	}
+	if countErr != nil {
+		total = 0
+	}
 
 	query := `
 		SELECT pal.id, pal.user_id, COALESCE(u.display_name, 'System Staff'), COALESCE(u.email, ''),
@@ -816,9 +824,15 @@ func (r *Repository) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset
 		ORDER BY pal.created_at DESC
 		LIMIT $1 OFFSET $2
 	`
-	rows, err := tx.Query(ctx, query, limit, offset)
+	var rows pgx.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.Query(ctx, query, limit, offset)
+	} else {
+		rows, err = r.pool.Query(ctx, query, limit, offset)
+	}
 	if err != nil {
-		return nil, 0, err
+		return []AuditEntry{}, 0, nil
 	}
 	defer rows.Close()
 

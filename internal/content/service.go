@@ -134,7 +134,7 @@ type Article struct {
 	Language        string           `json:"language"`
 	Title           string           `json:"title"`
 	Slug            string           `json:"slug"`
-	Body            string           `json:"body"`
+	Body            json.RawMessage  `json:"body"`
 	Excerpt         *string          `json:"excerpt,omitempty"`
 	Status          string           `json:"status"`
 	AuthorID        int64            `json:"author_id"`
@@ -274,16 +274,22 @@ func (s *Service) CreateArticle(ctx context.Context, tx pgx.Tx, authorID int64, 
 
 	// Link categories
 	for _, catID := range input.CategoryIDs {
-		_, _ = tx.Exec(ctx, "INSERT INTO article_categories (article_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, catID)
+		if _, err := tx.Exec(ctx, "INSERT INTO article_categories (article_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, catID); err != nil {
+			return nil, fmt.Errorf("link category %d: %w", catID, err)
+		}
 	}
 
 	// Link tags
 	for _, tagID := range input.TagIDs {
-		_, _ = tx.Exec(ctx, "INSERT INTO article_tags (article_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, tagID)
+		if _, err := tx.Exec(ctx, "INSERT INTO article_tags (article_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, tagID); err != nil {
+			return nil, fmt.Errorf("link tag %d: %w", tagID, err)
+		}
 	}
 
 	// Record initial version
-	_, _ = tx.Exec(ctx, `INSERT INTO article_versions (article_id, edited_by, diff, snapshot, version_num) VALUES ($1, $2, '{}', $3, 1)`, a.ID, authorID, input.Body)
+	if _, err := tx.Exec(ctx, `INSERT INTO article_versions (article_id, edited_by, diff, snapshot, version_num) VALUES ($1, $2, '{}', $3, 1)`, a.ID, authorID, input.Body); err != nil {
+		return nil, fmt.Errorf("record initial version: %w", err)
+	}
 
 	return &a, nil
 }
@@ -350,7 +356,7 @@ func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.U
 	query := `
 		UPDATE articles SET
 			title = COALESCE(NULLIF($2, ''), title),
-			body = COALESCE(NULLIF($3, 'null'::jsonb), body),
+			body = COALESCE(NULLIF($3::text, 'null'), body),
 			excerpt = $4,
 			language = COALESCE(NULLIF($5, ''), language),
 			is_breaking = $6,
@@ -385,21 +391,27 @@ func (s *Service) UpdateArticle(ctx context.Context, tx pgx.Tx, articleID uuid.U
 
 	// Sync categories with zero duplicates
 	if len(input.CategoryIDs) > 0 {
-		_, _ = tx.Exec(ctx, "DELETE FROM article_categories WHERE article_id = $1", a.ID)
+		if _, err := tx.Exec(ctx, "DELETE FROM article_categories WHERE article_id = $1", a.ID); err != nil {
+			return nil, fmt.Errorf("clear categories: %w", err)
+		}
 		seen := make(map[int]bool)
 		for _, catID := range input.CategoryIDs {
 			if catID > 0 && !seen[catID] {
 				seen[catID] = true
-				_, _ = tx.Exec(ctx, "INSERT INTO article_categories (article_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, catID)
+				if _, err := tx.Exec(ctx, "INSERT INTO article_categories (article_id, category_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.ID, catID); err != nil {
+					return nil, fmt.Errorf("link category %d: %w", catID, err)
+				}
 			}
 		}
 	}
 
 	// Record edit version diff
-	_, _ = tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO article_versions (article_id, edited_by, diff, snapshot, version_num) 
 		VALUES ($1, $2, '{}', $3, (SELECT COALESCE(MAX(version_num), 0) + 1 FROM article_versions WHERE article_id = $1))
-	`, a.ID, editorID, input.Body)
+	`, a.ID, editorID, input.Body); err != nil {
+		return nil, fmt.Errorf("record version: %w", err)
+	}
 
 	s.InvalidateHomeCache()
 	return &a, nil

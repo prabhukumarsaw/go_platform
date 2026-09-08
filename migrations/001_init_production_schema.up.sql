@@ -1,13 +1,25 @@
 -- 001_init_production_schema.up.sql
--- Complete Production Database Schema & Essential Production Seeds
-
--- Clean reset of all tables
-DROP TABLE IF EXISTS article_categories, article_tags, live_blog_entries, comments, articles, tags, categories, media, role_menu_actions, menu_actions, user_roles, user_session_contexts, user_category_scopes, user_permission_overrides, menus, roles, users, refresh_tokens, otp_requests, password_reset_tokens, user_activity_logs, web_stories, polls, poll_votes, newsletter_subscriptions, push_subscriptions, feedbacks, site_settings, activity_logs, consent_records CASCADE;
+-- Unified Clean Production Database Schema & Essential Seeds (Single-Tenant Architecture)
+-- Non-Tenant, High-Performance Newsroom & Reader Platform
 
 -- ──────────────────────────────────────────────
--- 1. EXTENSIONS & UUID
+-- 0. CLEAN RESET (Idempotent / Fresh Setup)
+-- ──────────────────────────────────────────────
+DROP TABLE IF EXISTS
+    article_categories, article_tags, article_versions, live_blog_entries,
+    comments, articles, tags, categories, media,
+    role_menu_actions, menu_actions, user_roles, user_category_scopes,
+    user_permission_overrides, permission_audit_log, abac_policies,
+    menus, roles, employees, users, refresh_tokens, otp_requests,
+    password_reset_tokens, user_activity_logs, web_stories, polls, poll_votes,
+    newsletter_subscriptions, push_subscriptions, feedbacks, site_settings,
+    activity_logs, consent_records, ad_slots, sponsored_articles CASCADE;
+
+-- ──────────────────────────────────────────────
+-- 1. EXTENSIONS
 -- ──────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ──────────────────────────────────────────────
 -- 2. USERS & AUTHENTICATION
@@ -20,7 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     first_name VARCHAR(100),
     last_name VARCHAR(100),
     display_name VARCHAR(200),
-    avatar_url TEXT,
+    avatar_url TEXT DEFAULT '',
     provider VARCHAR(50) DEFAULT 'local',
     totp_enabled BOOLEAN DEFAULT FALSE,
     is_active BOOLEAN DEFAULT TRUE,
@@ -68,21 +80,49 @@ CREATE TABLE IF NOT EXISTS user_activity_logs (
 );
 
 -- ──────────────────────────────────────────────
--- 3. IAM RBAC PERMISSIONS & ROLES
+-- 3. EMPLOYEES & STAFF DIRECTORY
+-- ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS employees (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    employee_code VARCHAR(100) UNIQUE NOT NULL,
+    department VARCHAR(100) NOT NULL DEFAULT 'Editorial',
+    designation VARCHAR(150) NOT NULL DEFAULT 'Special Correspondent',
+    district_id INT,
+    address TEXT DEFAULT '',
+    pin_code VARCHAR(20) DEFAULT '',
+    bio TEXT DEFAULT '',
+    press_card_no VARCHAR(100) DEFAULT '',
+    x_handle VARCHAR(100) DEFAULT '',
+    facebook VARCHAR(200) DEFAULT '',
+    instagram VARCHAR(200) DEFAULT '',
+    youtube VARCHAR(200) DEFAULT '',
+    is_active BOOLEAN DEFAULT TRUE,
+    joined_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ──────────────────────────────────────────────
+-- 4. IAM RBAC & ABAC GOVERNANCE
 -- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS roles (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) UNIQUE NOT NULL,
     description TEXT,
     is_system BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS menus (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) UNIQUE NOT NULL,
     label VARCHAR(150) NOT NULL,
+    icon VARCHAR(100) DEFAULT '',
     path VARCHAR(255) DEFAULT '',
+    parent_id INT REFERENCES menus(id) ON DELETE SET NULL,
     sort_order INT DEFAULT 0,
     is_active BOOLEAN DEFAULT TRUE
 );
@@ -91,48 +131,53 @@ CREATE TABLE IF NOT EXISTS menu_actions (
     id SERIAL PRIMARY KEY,
     menu_id INT REFERENCES menus(id) ON DELETE CASCADE,
     action VARCHAR(50) NOT NULL,
+    label VARCHAR(150) DEFAULT '',
     UNIQUE(menu_id, action)
 );
 
 CREATE TABLE IF NOT EXISTS role_menu_actions (
-    id SERIAL PRIMARY KEY,
     role_id INT REFERENCES roles(id) ON DELETE CASCADE,
     menu_action_id INT REFERENCES menu_actions(id) ON DELETE CASCADE,
-    UNIQUE(role_id, menu_action_id)
+    PRIMARY KEY(role_id, menu_action_id)
 );
 
 CREATE TABLE IF NOT EXISTS user_roles (
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
     role_id INT REFERENCES roles(id) ON DELETE CASCADE,
     is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY(user_id, role_id)
 );
 
-CREATE TABLE IF NOT EXISTS user_session_contexts (
-    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    active_district_id INT,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
 -- ──────────────────────────────────────────────
--- 4. TAXONOMY & CATEGORIES
+-- 5. TAXONOMY (Categories & Tags)
 -- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS categories (
     id SERIAL PRIMARY KEY,
-    parent_id INT REFERENCES categories(id) ON DELETE CASCADE,
+    parent_id INT REFERENCES categories(id) ON DELETE SET NULL,
     level INT DEFAULT 1,
     name VARCHAR(150) NOT NULL,
     slug VARCHAR(150) UNIQUE NOT NULL,
-    path TEXT DEFAULT '',
-    icon VARCHAR(50) DEFAULT '',
-    sort_order INT DEFAULT 1,
+    path TEXT,
+    icon VARCHAR(50),
+    sort_order INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    meta_title VARCHAR(255),
+    meta_description TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
-CREATE INDEX IF NOT EXISTS idx_categories_level ON categories(level);
 CREATE INDEX IF NOT EXISTS idx_categories_slug ON categories(slug);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) UNIQUE NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tags_slug ON tags(slug);
 
 CREATE TABLE IF NOT EXISTS user_category_scopes (
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
@@ -153,8 +198,30 @@ CREATE TABLE IF NOT EXISTS user_permission_overrides (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS permission_audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    menu_action_id INT,
+    action_name VARCHAR(80),
+    decision VARCHAR(20) NOT NULL,
+    reason TEXT,
+    ip_address INET,
+    user_agent TEXT,
+    request_id VARCHAR(100),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS abac_policies (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    attribute VARCHAR(30) NOT NULL,
+    value JSONB NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- ──────────────────────────────────────────────
--- 5. ARTICLES & EDITORIAL CONTENT
+-- 6. ARTICLES & EDITORIAL CONTENT
 -- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS articles (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -184,13 +251,23 @@ CREATE TABLE IF NOT EXISTS articles (
     caption TEXT DEFAULT '',
     primary_category_id INT REFERENCES categories(id) ON DELETE SET NULL,
     view_count INT DEFAULT 0,
+    search_vector tsvector GENERATED ALWAYS AS (
+        to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(excerpt, '') || ' ' || COALESCE(summary, ''))
+    ) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Essential Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_articles_slug ON articles(slug);
 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
 CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(primary_category_id);
+CREATE INDEX IF NOT EXISTS idx_articles_search_vector ON articles USING GIN (search_vector);
+CREATE INDEX IF NOT EXISTS idx_articles_title_trgm ON articles USING GIN (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_articles_published_feed ON articles (published_at DESC) WHERE status = 'published';
+CREATE INDEX IF NOT EXISTS idx_articles_category_feed ON articles (primary_category_id, published_at DESC) WHERE status = 'published';
+CREATE INDEX IF NOT EXISTS idx_articles_breaking_feed ON articles (published_at DESC) WHERE status = 'published' AND is_breaking = TRUE;
+CREATE INDEX IF NOT EXISTS idx_articles_featured_feed ON articles (published_at DESC) WHERE status = 'published' AND is_featured = TRUE;
 
 CREATE TABLE IF NOT EXISTS article_categories (
     article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
@@ -198,18 +275,24 @@ CREATE TABLE IF NOT EXISTS article_categories (
     PRIMARY KEY(article_id, category_id)
 );
 
-CREATE TABLE IF NOT EXISTS tags (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL,
-    slug VARCHAR(100) UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
 CREATE TABLE IF NOT EXISTS article_tags (
     article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
     tag_id INT REFERENCES tags(id) ON DELETE CASCADE,
     PRIMARY KEY(article_id, tag_id)
 );
+
+CREATE TABLE IF NOT EXISTS article_versions (
+    id BIGSERIAL PRIMARY KEY,
+    article_id UUID NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    edited_by BIGINT NOT NULL REFERENCES users(id),
+    diff JSONB NOT NULL DEFAULT '{}',
+    snapshot JSONB,
+    version_num INT DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_article_versions_article_id ON article_versions(article_id);
+CREATE INDEX IF NOT EXISTS idx_article_versions_created_at ON article_versions(article_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS comments (
     id SERIAL PRIMARY KEY,
@@ -224,6 +307,9 @@ CREATE TABLE IF NOT EXISTS comments (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_comments_article_id ON comments(article_id);
+CREATE INDEX IF NOT EXISTS idx_comments_status ON comments(status);
+
 CREATE TABLE IF NOT EXISTS live_blog_entries (
     id SERIAL PRIMARY KEY,
     article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
@@ -237,8 +323,10 @@ CREATE TABLE IF NOT EXISTS live_blog_entries (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_live_blog_article ON live_blog_entries(article_id, created_at DESC);
+
 -- ──────────────────────────────────────────────
--- 6. MEDIA LIBRARY & INTERACTIVE FEATURES
+-- 7. MEDIA LIBRARY
 -- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS media (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -262,6 +350,9 @@ CREATE INDEX IF NOT EXISTS idx_media_category ON media(category);
 CREATE INDEX IF NOT EXISTS idx_media_folder ON media(folder);
 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at DESC);
 
+-- ──────────────────────────────────────────────
+-- 8. AUDIENCE, NOTIFICATIONS & ENGAGEMENT
+-- ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS web_stories (
     id SERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
@@ -332,7 +423,7 @@ CREATE TABLE IF NOT EXISTS feedbacks (
 
 CREATE TABLE IF NOT EXISTS site_settings (
     id SERIAL PRIMARY KEY,
-    site_name VARCHAR(255) DEFAULT 'Naxatra News',
+    site_name VARCHAR(255) DEFAULT 'NewsRoom',
     logo_url TEXT,
     contact_email VARCHAR(255),
     description TEXT,
@@ -357,25 +448,54 @@ CREATE TABLE IF NOT EXISTS consent_records (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS ad_slots (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slot_type VARCHAR(30) NOT NULL,
+    ad_unit_id VARCHAR(200),
+    config JSONB DEFAULT '{}',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS sponsored_articles (
+    article_id UUID PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+    sponsor VARCHAR(200) NOT NULL,
+    campaign_id VARCHAR(100),
+    start_date DATE,
+    end_date DATE
+);
+
 -- ──────────────────────────────────────────────
--- 7. INITIAL PRODUCTION ESSENTIAL SEEDS
+-- 9. PRODUCTION ESSENTIAL SEEDS
 -- ──────────────────────────────────────────────
 
--- 7.1 Single-word label Menus
-INSERT INTO menus (name, label, path, sort_order, is_active) VALUES
-    ('dashboard',     'Dashboard',  '/panel/dashboard', 1, TRUE),
-    ('articles',      'Articles',   '/panel/articles',  2, TRUE),
-    ('categories',    'Categories', '/panel/categories',3, TRUE),
-    ('tags',          'Tags',       '/panel/tags',      4, TRUE),
-    ('media_library', 'Media',      '/panel/media',     5, TRUE),
-    ('live_blogs',    'Liveblogs',  '/panel/liveblog',  6, TRUE),
-    ('comments',      'Comments',   '/panel/comments',  7, TRUE),
-    ('roles',         'Roles',      '/panel/roles',     8, TRUE),
-    ('users',         'Users',      '/panel/users',     9, TRUE),
-    ('settings',      'Settings',   '/panel/settings', 10, TRUE)
-ON CONFLICT (name) DO UPDATE SET label = EXCLUDED.label, path = EXCLUDED.path;
+-- 9.1 Active Synchronized Navigation Menus (Exact 1-to-1 Match with Panel Routes)
+INSERT INTO menus (name, label, icon, path, sort_order, is_active) VALUES
+    ('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE),
+    ('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE),
+    ('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE),
+    ('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE),
+    ('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE),
+    ('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE),
+    ('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE),
+    ('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE),
+    ('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE),
+    ('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE),
+    ('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE),
+    ('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE),
+    ('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE),
+    ('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE),
+    ('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE),
+    ('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE)
+ON CONFLICT (name) DO UPDATE SET
+    label      = EXCLUDED.label,
+    icon       = EXCLUDED.icon,
+    path       = EXCLUDED.path,
+    sort_order = EXCLUDED.sort_order,
+    is_active  = EXCLUDED.is_active;
 
--- 7.2 Menu Actions Generation
+-- 9.2 Menu Actions Generation
 DO $$
 DECLARE
     m RECORD;
@@ -389,39 +509,44 @@ BEGIN
     END LOOP;
 END $$;
 
--- 7.3 System Roles
-INSERT INTO roles (name, description, is_system) VALUES
-    ('super_admin', 'Full platform-wide root authority', TRUE),
-    ('editor',      'Editorial publishing and review authority', TRUE),
-    ('sub_editor',  'Content review and editing desk', TRUE),
-    ('reporter',    'Field journalism and draft creation', TRUE),
-    ('moderator',   'Community and comment moderation authority', TRUE)
-ON CONFLICT (name) DO NOTHING;
+-- 9.3 System Roles
+INSERT INTO roles (name, description, is_system, is_active) VALUES
+    ('super_admin', 'Full platform-wide root authority',           TRUE, TRUE),
+    ('editor',      'Editorial publishing and review authority',   TRUE, TRUE),
+    ('sub_editor',  'Content review and editing desk',             TRUE, TRUE),
+    ('reporter',    'Field journalism and draft creation',         TRUE, TRUE),
+    ('moderator',   'Community and comment moderation authority',  TRUE, TRUE)
+ON CONFLICT (name) DO UPDATE SET is_active = TRUE;
 
--- 7.4 Role Permission Grants
-DO $$
-DECLARE
-    r_super INT;
-    r_editor INT;
-    ma RECORD;
-BEGIN
-    SELECT id INTO r_super FROM roles WHERE name = 'super_admin';
-    SELECT id INTO r_editor FROM roles WHERE name = 'editor';
+-- 9.4 Role Permission Grants
+-- super_admin: ALL permissions
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r CROSS JOIN menu_actions ma WHERE r.name = 'super_admin'
+ON CONFLICT DO NOTHING;
 
-    IF r_super IS NOT NULL THEN
-        FOR ma IN SELECT id FROM menu_actions LOOP
-            INSERT INTO role_menu_actions (role_id, menu_action_id) VALUES (r_super, ma.id) ON CONFLICT DO NOTHING;
-        END LOOP;
-    END IF;
+-- editor: VIEW, ADD, EDIT, PUBLISH on all menus
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r
+JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT','PUBLISH')
+WHERE r.name = 'editor'
+ON CONFLICT DO NOTHING;
 
-    IF r_editor IS NOT NULL THEN
-        FOR ma IN SELECT id FROM menu_actions LOOP
-            INSERT INTO role_menu_actions (role_id, menu_action_id) VALUES (r_editor, ma.id) ON CONFLICT DO NOTHING;
-        END LOOP;
-    END IF;
-END $$;
+-- reporter: VIEW, ADD, EDIT
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r
+JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+WHERE r.name = 'reporter'
+ON CONFLICT DO NOTHING;
 
--- 7.5 Production Superadmin Account (admin123)
+-- moderator: VIEW, APPROVE, DELETE on comments and audit
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r
+JOIN menu_actions ma ON ma.action IN ('VIEW','APPROVE','DELETE')
+JOIN menus m ON m.id = ma.menu_id AND m.name IN ('comments', 'audit')
+WHERE r.name = 'moderator'
+ON CONFLICT DO NOTHING;
+
+-- 9.5 Production Superadmin Account (admin123)
 INSERT INTO users (email, password_hash, first_name, last_name, display_name, is_staff, is_super_admin, is_active)
 VALUES (
     'superadmin@newsplatform.in',
@@ -441,7 +566,13 @@ INSERT INTO user_roles (user_id, role_id)
 SELECT u.id, r.id FROM users u, roles r WHERE u.email = 'superadmin@newsplatform.in' AND r.name = 'super_admin'
 ON CONFLICT DO NOTHING;
 
--- 7.6 Pure Hindi Category Desks & Regional Sub-Desks
+-- 9.6 Superadmin Employee Profile
+INSERT INTO employees (user_id, employee_code, department, designation, bio, press_card_no, is_active)
+SELECT u.id, 'EMP-0001', 'Editorial', 'Chief Editor', 'Platform Chief Editor & Root Administrator', 'PRESS-CHIEF-01', TRUE
+FROM users u WHERE u.email = 'superadmin@newsplatform.in'
+ON CONFLICT (user_id) DO NOTHING;
+
+-- 9.7 Pure Hindi Category Desks & Regional Sub-Desks
 INSERT INTO categories (parent_id, level, name, slug, path, sort_order) VALUES
     (NULL, 1, 'दुनिया', 'world', 'दुनिया', 1),
     (NULL, 1, 'भारत', 'national', 'भारत', 2),
@@ -559,7 +690,7 @@ ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name, parent_id = EXCLUDED.pare
 
 SELECT setval('categories_id_seq', (SELECT GREATEST(MAX(id), 200) FROM categories));
 
--- 7.7 Production Essential Sample Hindi Articles Seed
+-- 9.8 Production Essential Sample Hindi Articles Seed
 INSERT INTO articles (title, slug, summary, excerpt, content, body, featured_image, featured_image_url, author_id, primary_category_id, status, language, view_count, published_at, is_breaking, is_featured)
 SELECT
     val.title, val.slug, val.summary, val.summary, val.content, val.content, val.featured_image_url, val.featured_image_url,
@@ -580,4 +711,3 @@ ON CONFLICT (slug) DO UPDATE SET title = EXCLUDED.title, summary = EXCLUDED.summ
 INSERT INTO article_categories (article_id, category_id)
 SELECT a.id, a.primary_category_id FROM articles a
 ON CONFLICT DO NOTHING;
-

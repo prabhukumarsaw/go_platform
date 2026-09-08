@@ -52,12 +52,9 @@ func (h *Handler) ListApprovedComments(c *fiber.Ctx) error {
 	return response.Success(c, comments)
 }
 
-// AddComment submits a new comment (requires auth).
+// AddComment submits a new comment (supports authenticated users and public readers).
 func (h *Handler) AddComment(c *fiber.Ctx) error {
 	sess := middleware.SessionFromCtx(c)
-	if sess == nil {
-		return response.Unauthorized(c, "You must be logged in to comment")
-	}
 	tx := c.Locals("tx").(pgx.Tx)
 
 	articleID, err := uuid.Parse(c.Params("articleId"))
@@ -71,13 +68,27 @@ func (h *Handler) AddComment(c *fiber.Ctx) error {
 	}
 	input.ArticleID = articleID
 
-	if input.Body == "" {
+	body := input.Body
+	if body == "" {
+		body = input.Content
+	}
+	if body == "" {
 		return response.BadRequest(c, "Comment body cannot be empty")
 	}
+	input.Body = body
 
-	comment, err := h.service.AddComment(c.Context(), tx, sess.UserID, input)
+	var userID *int64
+	if sess != nil && sess.UserID > 0 {
+		userID = &sess.UserID
+	}
+
+	if input.AuthorName == "" {
+		input.AuthorName = "पाठक (Reader)"
+	}
+
+	comment, err := h.service.AddComment(c.Context(), tx, userID, input)
 	if err != nil {
-		return response.InternalError(c, "Failed to post comment")
+		return response.InternalError(c, "Failed to post comment: "+err.Error())
 	}
 
 	return response.Created(c, comment)

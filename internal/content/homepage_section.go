@@ -170,6 +170,7 @@ func (s *Service) seedComprehensiveContent(ctx context.Context) {
 		{"Dharma", "dharma", "धर्म", "#b45309"},
 		{"Environment", "environment", "पर्यावरण", "#15803d"},
 		{"International", "international", "अंतरराष्ट्रीय", "#3b82f6"},
+		{"Videos", "videos", "वीडियो", "#dc2626"},
 	}
 
 	for _, c := range categoriesSeed {
@@ -342,17 +343,108 @@ func (s *Service) seedComprehensiveContent(ctx context.Context) {
 			IsFeatured:  true,
 			ViewCount:   14800,
 		},
+		// ─── Video News Bulletin (with real YouTube media thumbnails) ───
+		{
+			Title:       "DM Viral Video: बच्ची ने सड़क बनाने के लिए बुलाया तो लखीमपुर खीरी DM सीधे पहुंच गए उसके गांव, फिर...",
+			Slug:        "dm-viral-video-girl-calls-dm-for-road-lakhimpur-kheri",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/M7lc1UVf-VE/hqdefault.jpg",
+			Excerpt:     "मामला उत्तर प्रदेश के लखीमपुर खीरी से जुड़ा है। एक अधिकारी का बर्ताव जनता के प्रति कैसा होना चाहिए उसका भी एक उदाहरण प्रस्तुत किया है लखीमपुर डीएम ने।",
+			IsBreaking:  false,
+			IsFeatured:  true,
+			ViewCount:   42500,
+		},
+		{
+			Title:       "West Bengal में चुनावी नतीजों के बाद जगह-जगह हिंसा, आसनसोल और कोलकाता के टीएमसी दफ्तरों पर...",
+			Slug:        "west-bengal-election-results-violence-tmc-office-kolkata",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+			Excerpt:     "पश्चिम बंगाल में चुनाव परिणाम के बाद राजनीतिक तनाव बढ़ गया है। पुलिस ने संवेदनशील इलाकों में सुरक्षा बल तैनात किए हैं।",
+			IsBreaking:  true,
+			IsFeatured:  false,
+			ViewCount:   28900,
+		},
+		{
+			Title:       "Patna: अंचलाधिकारियों का हड़ताल मामला, डिप्टी सीएम विजय सिन्हा ने बुलायी बैठक",
+			Slug:        "patna-anchal-adhikari-strike-deputy-cm-vijay-sinha-meeting",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/9bZkp7q19f0/hqdefault.jpg",
+			Excerpt:     "राजस्व एवं भूमि सुधार विभाग के अधिकारियों की मांगों को लेकर सचिवालय में उप मुख्यमंत्री विजय सिन्हा ने समीक्षा बैठक की।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   19400,
+		},
+		{
+			Title:       "Assam में आज शाम थम जाएगा चुनाव प्रचार, अंतिम दिन तमाम दलों ने झोंकी पूरी ताकत",
+			Slug:        "assam-election-campaign-ends-parties-show-strength",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/kJQP7kiw5Fk/hqdefault.jpg",
+			Excerpt:     "असम विधानसभा चुनाव के पहले चरण के लिए चुनाव प्रचार का शोर आज शाम थम जाएगा। दिग्गजों ने रैलियों को संबोधित किया।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   16200,
+		},
+		{
+			Title:       "Assam Assembly Election 2026: झारखंड में तो सरकार गिराना चाहते थे हिमंता.. बंधु तिर्की का बड़ा बयान",
+			Slug:        "assam-assembly-election-bandhu-tirkey-himanta-statement",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/fJ9rUzIMcZQ/hqdefault.jpg",
+			Excerpt:     "पूर्व मंत्री और कांग्रेस नेता बंधु तिर्की ने असम चुनाव के दौरान असम के मुख्यमंत्री हिमंता बिस्वा सरमा पर तीखा हमला बोला।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   22100,
+		},
+		{
+			Title:       "“ऐसी असम्मानजनक विदाई...“ Tejashwi के ट्वीट पर Neeraj Kumar का तगड़ा जवाब",
+			Slug:        "tejashwi-yadav-tweet-neeraj-kumar-jdu-reaction-video",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/L_LUpnjgPso/hqdefault.jpg",
+			Excerpt:     "जेडीयू मुख्य प्रवक्ता नीरज कुमार ने नेता प्रतिपक्ष तेजस्वी यादव के हालिया बयान पर पलटवार करते हुए तीखा हमला बोला।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   31200,
+		},
+		{
+			Title:       "Mokama विधायक Anant Singh के गांव में आज महादंगल, रहने-खाने का पूरा इंतजाम",
+			Slug:        "mokama-mla-anant-singh-village-mahadangal-wrestling-event",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/RgKAFK5djSk/hqdefault.jpg",
+			Excerpt:     "मोकामा के पूर्व बाहुबली विधायक अनंत सिंह के पैतृक गांव नदवां में पारंपरिक कुश्ती महादंगल का भव्य आयोजन किया गया।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   38700,
+		},
+		{
+			Title:       "Assam Election 2026: तिनसुकिया में नक्षत्र न्यूज की चुनावी यात्रा, जानें आदिवासियों की क्या है राय",
+			Slug:        "assam-election-tinsukia-ground-report-tribal-voters",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/2Vv-BfVoq4g/hqdefault.jpg",
+			Excerpt:     "चाय बागान क्षेत्रों में चुनावी सरगर्मी तेज है। नक्षत्र न्यूज़ की टीम ने ग्राउंड जीरो पर पहुंचकर स्थानीय मतदाताओं से बातचीत की।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   17800,
+		},
+		{
+			Title:       "Ranchi: चुटिया इलाके में गैस वितरण केंद्र पर हंगामा, नंबर लगने के बावजूद नहीं मिल रहा सिलिंडर",
+			Slug:        "ranchi-chutia-lpg-gas-distribution-center-chaos-video",
+			Category:    "videos",
+			Image:       "https://img.youtube.com/vi/JGwWNGJdvx8/hqdefault.jpg",
+			Excerpt:     "राजधानी रांची के चुटिया इलाके में एलपीजी गैस वितरण केंद्र पर सुबह से ही उपभोक्ताओं की लंबी कतार लगी रही।",
+			IsBreaking:  false,
+			IsFeatured:  false,
+			ViewCount:   24600,
+		},
 	}
 
 	for _, art := range articlesSeed {
 		_, _ = s.pool.Exec(ctx, `
 			INSERT INTO articles (
-				tenant_id, author_id, title, slug, summary, content,
+				author_id, title, slug, summary, content,
 				featured_image, status, is_breaking, is_featured, is_national,
 				language, view_count, published_at
 			)
 			VALUES (
-				1, 1, $1, $2, $3, $3,
+				1, $1, $2, $3, $3,
 				$4, 'published', $5, $6, TRUE,
 				'hi', $7, NOW() - (RANDOM() * INTERVAL '12 hours')
 			)

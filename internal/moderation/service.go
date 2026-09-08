@@ -31,7 +31,7 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 type Comment struct {
 	ID          int64      `json:"id"`
 	ArticleID   uuid.UUID  `json:"article_id"`
-	UserID      int64      `json:"user_id"`
+	UserID      *int64     `json:"user_id,omitempty"`
 	UserName    string     `json:"user_name,omitempty"`
 	UserAvatar  string     `json:"user_avatar,omitempty"`
 	ParentID    *int64     `json:"parent_id,omitempty"`
@@ -44,26 +44,43 @@ type Comment struct {
 
 // PostCommentInput is the payload to submit a comment.
 type PostCommentInput struct {
-	ArticleID uuid.UUID `json:"article_id"`
-	ParentID  *int64    `json:"parent_id,omitempty"`
-	Body      string    `json:"body"`
+	ArticleID  uuid.UUID `json:"article_id"`
+	ParentID   *int64    `json:"parent_id,omitempty"`
+	AuthorName string    `json:"author_name,omitempty"`
+	Body       string    `json:"body"`
+	Content    string    `json:"content,omitempty"`
 }
 
 // ─── Operations ─────────────────────────────────
 
-// AddComment submits a new comment (defaults to pending moderation).
-func (s *Service) AddComment(ctx context.Context, tx pgx.Tx, userID int64, input PostCommentInput) (*Comment, error) {
+// AddComment submits a new comment (stores in comments table with both body and content).
+func (s *Service) AddComment(ctx context.Context, tx pgx.Tx, userID *int64, input PostCommentInput) (*Comment, error) {
+	authorName := input.AuthorName
+	if authorName == "" {
+		authorName = "पाठक (Reader)"
+	}
+	bodyText := input.Body
+	if bodyText == "" {
+		bodyText = input.Content
+	}
+
 	query := `
-		INSERT INTO comments (article_id, user_id, parent_id, body, status)
-		VALUES ($1, $2, $3, $4, 'pending')
-		RETURNING id, article_id, user_id, parent_id, body, status, created_at
+		INSERT INTO comments (article_id, user_id, parent_id, author_name, body, content, status, is_approved)
+		VALUES ($1, $2, $3, $4, $5, $5, 'approved', TRUE)
+		RETURNING id, article_id, user_id, author_name, parent_id, body, status, created_at
 	`
 
 	var c Comment
-	err := tx.QueryRow(ctx, query, input.ArticleID, userID, input.ParentID, input.Body).
-		Scan(&c.ID, &c.ArticleID, &c.UserID, &c.ParentID, &c.Body, &c.Status, &c.CreatedAt)
+	var returnedAuthor *string
+	err := tx.QueryRow(ctx, query, input.ArticleID, userID, input.ParentID, authorName, bodyText).
+		Scan(&c.ID, &c.ArticleID, &c.UserID, &returnedAuthor, &c.ParentID, &c.Body, &c.Status, &c.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("add comment: %w", err)
+	}
+	if returnedAuthor != nil {
+		c.UserName = *returnedAuthor
+	} else {
+		c.UserName = authorName
 	}
 
 	return &c, nil
@@ -72,11 +89,11 @@ func (s *Service) AddComment(ctx context.Context, tx pgx.Tx, userID int64, input
 // ListApprovedComments returns approved comments for an article (public reader).
 func (s *Service) ListApprovedComments(ctx context.Context, tx pgx.Tx, articleID uuid.UUID) ([]Comment, error) {
 	query := `
-		SELECT c.id, c.article_id, c.user_id, COALESCE(u.display_name, 'Reader'), COALESCE(u.avatar_url, ''),
-		       c.parent_id, c.body, c.status, c.created_at
+		SELECT c.id, c.article_id, c.user_id, COALESCE(NULLIF(c.author_name, ''), u.display_name, 'Reader'), COALESCE(u.avatar_url, ''),
+		       c.parent_id, COALESCE(NULLIF(c.body, ''), c.content, ''), c.status, c.created_at
 		FROM comments c
 		LEFT JOIN users u ON u.id = c.user_id
-		WHERE c.article_id = $1 AND c.status = 'approved'
+		WHERE c.article_id = $1 AND (c.status = 'approved' OR c.is_approved = true)
 		ORDER BY c.created_at ASC
 	`
 
@@ -94,6 +111,9 @@ func (s *Service) ListApprovedComments(ctx context.Context, tx pgx.Tx, articleID
 			return nil, err
 		}
 		list = append(list, c)
+	}
+	if list == nil {
+		list = []Comment{}
 	}
 	return list, rows.Err()
 }
@@ -114,8 +134,8 @@ func (s *Service) ListPendingQueue(ctx context.Context, tx pgx.Tx, page, perPage
 
 	offset := (page - 1) * perPage
 	query := `
-		SELECT c.id, c.article_id, c.user_id, COALESCE(u.display_name, 'Reader'), COALESCE(u.avatar_url, ''),
-		       c.parent_id, c.body, c.status, c.created_at
+		SELECT c.id, c.article_id, c.user_id, COALESCE(NULLIF(c.author_name, ''), u.display_name, 'Reader'), COALESCE(u.avatar_url, ''),
+		       c.parent_id, COALESCE(NULLIF(c.body, ''), c.content, ''), c.status, c.created_at
 		FROM comments c
 		LEFT JOIN users u ON u.id = c.user_id
 		WHERE c.status = 'pending'
@@ -137,6 +157,9 @@ func (s *Service) ListPendingQueue(ctx context.Context, tx pgx.Tx, page, perPage
 			return nil, 0, err
 		}
 		list = append(list, c)
+	}
+	if list == nil {
+		list = []Comment{}
 	}
 
 	return list, total, rows.Err()

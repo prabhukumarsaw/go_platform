@@ -22,6 +22,7 @@ type HomeArticleItem struct {
 	Date      string `json:"date"`
 	Category  string `json:"category"`
 	Author    string `json:"author,omitempty"`
+	Excerpt   string `json:"excerpt,omitempty"`
 	ViewCount int64  `json:"view_count,omitempty"`
 }
 
@@ -61,6 +62,7 @@ type VideoNewsItem struct {
 	PublishedAt string `json:"publishedAt"`
 	Views       string `json:"views"`
 	Author      string `json:"author,omitempty"`
+	Excerpt     string `json:"excerpt,omitempty"`
 }
 
 // StateDeskData holds state desk (Jharkhand & Bihar) and editorial sidebar blocks.
@@ -345,6 +347,21 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 		PerPage:  35,
 	})
 
+	videoCandidatesPool := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Category: "videos",
+		Status:   "published",
+		PerPage:  25,
+	})
+	if len(videoCandidatesPool) == 0 {
+		videoCandidatesPool = fetchCandidates(ListArticlesFilter{
+			Language: language,
+			Category: "video",
+			Status:   "published",
+			PerPage:  25,
+		})
+	}
+
 	// Helper functions for selecting unique, non-duplicated articles
 	takeSingle := func(candidates []ArticleListItem) *HomeArticleItem {
 		for _, it := range candidates {
@@ -468,23 +485,47 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 	resp.ContentSidebarData.SidebarOpinion.Right = takeMultiple(generalPool, 3)
 
 	// ─── PIPELINE STEP 5: VIDEO NEWS SECTION ─────────────────────────────────
-	videoCandidates := takeMultiple(generalPool, 6)
-	defaultDurations := []string{"03:45", "05:12", "02:30", "04:15", "06:20", "03:10"}
-	defaultViews := []string{"14.5K", "28.2K", "9.8K", "52.1K", "18.3K", "34.0K"}
+	videoCandidates := takeMultiple(videoCandidatesPool, 8)
+	if len(videoCandidates) < 7 {
+		videoCandidates = append(videoCandidates, takeMultiple(generalPool, 8-len(videoCandidates))...)
+	}
+	defaultDurations := []string{"03:45", "05:12", "02:30", "04:15", "06:20", "03:10", "04:45", "02:55"}
+	defaultViews := []string{"42.5K", "28.9K", "19.4K", "16.2K", "22.1K", "31.2K", "38.7K", "17.8K"}
+
+	extractVideoMeta := func(image string) (string, string) {
+		thumbnail := image
+		if thumbnail == "" {
+			thumbnail = "/assets/newsplaceholder.webp"
+		}
+		if strings.Contains(image, "youtube.com/vi/") {
+			parts := strings.Split(image, "youtube.com/vi/")
+			if len(parts) > 1 {
+				subParts := strings.Split(parts[1], "/")
+				if len(subParts) > 0 && len(subParts[0]) == 11 {
+					vid := subParts[0]
+					return "https://www.youtube.com/watch?v=" + vid, image
+				}
+			}
+		}
+		return "", thumbnail
+	}
+
 	for idx, it := range videoCandidates {
 		dur := defaultDurations[idx%len(defaultDurations)]
 		vw := defaultViews[idx%len(defaultViews)]
+		vUrl, thumb := extractVideoMeta(it.Image)
 		resp.VideoNewsData = append(resp.VideoNewsData, VideoNewsItem{
 			ID:          it.ID,
 			Title:       it.Title,
 			Slug:        it.Slug,
-			VideoURL:    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-			Thumbnail:   it.Image,
+			VideoURL:    vUrl,
+			Thumbnail:   thumb,
 			Category:    it.Category,
 			Duration:    dur,
 			PublishedAt: it.Date,
 			Views:       vw,
 			Author:      it.Author,
+			Excerpt:     it.Excerpt,
 		})
 	}
 
@@ -575,6 +616,13 @@ func toHomeArticleItem(item ArticleListItem) HomeArticleItem {
 		author = "विशेष संवाददाता"
 	}
 
+	excerpt := ""
+	if item.Excerpt != nil && *item.Excerpt != "" {
+		excerpt = *item.Excerpt
+	} else {
+		excerpt = item.Title
+	}
+
 	return HomeArticleItem{
 		ID:        item.ID.String(),
 		Slug:      item.Slug,
@@ -583,6 +631,7 @@ func toHomeArticleItem(item ArticleListItem) HomeArticleItem {
 		Date:      dateStr,
 		Category:  cat,
 		Author:    author,
+		Excerpt:   excerpt,
 		ViewCount: item.ViewCount,
 	}
 }
