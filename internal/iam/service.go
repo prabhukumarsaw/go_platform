@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,11 +13,18 @@ import (
 	"github.com/rs/zerolog"
 )
 
+type menuCache struct {
+	menus     []Menu
+	expiresAt time.Time
+}
+
 // Service implements the enterprise IAM permission engine.
 type Service struct {
 	repo   *Repository
 	pool   *pgxpool.Pool
 	logger zerolog.Logger
+	cache  menuCache
+	cacheMu sync.RWMutex
 }
 
 // NewService creates a new IAM service.
@@ -43,6 +52,19 @@ func (s *Service) Can(ctx context.Context, userID int64, action string) (bool, e
 	return s.CanWithContext(ctx, CanRequest{
 		UserID: userID,
 		Action: action,
+	})
+}
+
+// Evaluate adapts a middleware.PermissionEval-style check (used by RBAC guards).
+func (s *Service) Evaluate(ctx context.Context, userID int64, isSuperAdmin bool, action, ip, ua, requestID, device string) (bool, error) {
+	return s.CanWithContext(ctx, CanRequest{
+		UserID:       userID,
+		Action:       action,
+		IsSuperAdmin: isSuperAdmin,
+		IPAddress:    ip,
+		UserAgent:    ua,
+		RequestID:    requestID,
+		DeviceType:   device,
 	})
 }
 
@@ -76,9 +98,17 @@ func (s *Service) CanWithContext(ctx context.Context, req CanRequest) (bool, err
 
 // evaluate runs the 5-step permission evaluation chain.
 func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalCtx *EvalContext) (bool, error) {
-	// Step 1: super_admin bypass
-	if req.IsSuperAdmin {
-		s.audit(ctx, tx, req, "OVERRIDE_GRANT", "super_admin bypass")
+	var isActive, isSA bool
+	_ = tx.QueryRow(ctx, `SELECT COALESCE(is_active, FALSE), COALESCE(is_super_admin, FALSE) FROM users WHERE id = $1`, req.UserID).
+		Scan(&isActive, &isSA)
+	if !isActive {
+		s.audit(ctx, tx, req, "DENIED", "account_inactive")
+		return false, nil
+	}
+	if req.IsSuperAdmin || isSA {
+		if !isViewAction(req.Action) {
+			s.audit(ctx, tx, req, "OVERRIDE_GRANT", "super_admin bypass")
+		}
 		return true, nil
 	}
 
@@ -129,13 +159,19 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 			reason = "role_grant blocked by ABAC"
 		}
 
-		s.audit(ctx, tx, req, decision, reason)
+		if !abacPassed || !isViewAction(req.Action) {
+			s.audit(ctx, tx, req, decision, reason)
+		}
 		return abacPassed, nil
 	}
 
 	// Step 5: default deny
 	s.audit(ctx, tx, req, "DENIED", "no_matching_rule")
 	return false, nil
+}
+
+func isViewAction(action string) bool {
+	return strings.HasSuffix(strings.ToUpper(action), ".VIEW")
 }
 
 // audit writes a decision record to the permission audit log.
@@ -194,11 +230,19 @@ func (s *Service) GetRolePermissionMatrixDirect(ctx context.Context, roleID int,
 }
 
 func (s *Service) AssignRolePermissions(ctx context.Context, tx pgx.Tx, roleID int, _ int64, menuActionIDs []int) error {
-	return s.repo.AssignRolePermissions(ctx, tx, roleID, menuActionIDs)
+	err := s.repo.AssignRolePermissions(ctx, tx, roleID, menuActionIDs)
+	if err == nil {
+		s.InvalidateMenuCache()
+	}
+	return err
 }
 
 func (s *Service) AssignUserRole(ctx context.Context, tx pgx.Tx, userID int64, _ int64, roleID int, assignedBy int64) error {
-	return s.repo.AssignUserRole(ctx, tx, userID, roleID, assignedBy)
+	err := s.repo.ReplaceUserRole(ctx, tx, userID, roleID, assignedBy)
+	if err == nil {
+		s.InvalidateMenuCache()
+	}
+	return err
 }
 
 // ─── Category / Bureau Scopes ───────────────────
@@ -232,6 +276,35 @@ func (s *Service) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
 }
 
 func (s *Service) ListMenusDirect(ctx context.Context) ([]Menu, error) {
+	s.cacheMu.RLock()
+	if time.Now().Before(s.cache.expiresAt) && s.cache.menus != nil {
+		menus := s.cache.menus
+		s.cacheMu.RUnlock()
+		return menus, nil
+	}
+	s.cacheMu.RUnlock()
+
+	menus, err := s.repo.ListMenusDirect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.cacheMu.Lock()
+	s.cache = menuCache{menus: menus, expiresAt: time.Now().Add(15 * time.Second)}
+	s.cacheMu.Unlock()
+	return menus, nil
+}
+
+func (s *Service) InvalidateMenuCache() {
+	s.cacheMu.Lock()
+	s.cache = menuCache{}
+	s.cacheMu.Unlock()
+}
+
+func (s *Service) ListMenusForUser(ctx context.Context, tx pgx.Tx, userID int64, isSuperAdmin bool) ([]Menu, error) {
+	return s.repo.ListMenusForUser(ctx, tx, userID, isSuperAdmin)
+}
+
+func (s *Service) ListMenuPrefixes(ctx context.Context) ([]Menu, error) {
 	return s.repo.ListMenusDirect(ctx)
 }
 

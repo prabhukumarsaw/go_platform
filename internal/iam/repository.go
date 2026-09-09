@@ -45,6 +45,8 @@ type Menu struct {
 	Path      string `json:"path"`
 	SortOrder int    `json:"sort_order"`
 	IsActive  bool   `json:"is_active"`
+	GroupName string `json:"group_name"`
+	APIPrefix string `json:"api_prefix"`
 }
 
 // MenuAction represents a permission atom (e.g., articles.PUBLISH).
@@ -461,52 +463,98 @@ func (r *Repository) AssignRolePermissions(ctx context.Context, tx pgx.Tx, roleI
 
 // ─── Menu Queries ──────────────────────────────
 
-func (r *Repository) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
-	query := `
-		SELECT id, name, label, COALESCE(path,''), sort_order, COALESCE(is_active, true)
+const menusSelect = `
+		SELECT id, name, label, COALESCE(icon,''), COALESCE(path,''), sort_order, COALESCE(is_active, true),
+		       COALESCE(group_name, 'content'), COALESCE(api_prefix, '')
 		FROM menus
 		WHERE is_active IS NOT FALSE
 		ORDER BY sort_order ASC, id ASC
-	`
-	rows, err := tx.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+`
 
+func scanMenus(rows pgx.Rows) ([]Menu, error) {
+	defer rows.Close()
 	var menus []Menu
 	for rows.Next() {
 		var m Menu
-		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.Icon, &m.Path, &m.SortOrder, &m.IsActive, &m.GroupName, &m.APIPrefix); err != nil {
 			return nil, err
 		}
 		menus = append(menus, m)
+	}
+	if menus == nil {
+		menus = []Menu{}
 	}
 	return menus, rows.Err()
 }
 
-func (r *Repository) ListMenusDirect(ctx context.Context) ([]Menu, error) {
-	query := `
-		SELECT id, name, label, COALESCE(path,''), sort_order, COALESCE(is_active, true)
-		FROM menus
-		WHERE is_active IS NOT FALSE
-		ORDER BY sort_order ASC, id ASC
-	`
-	rows, err := r.pool.Query(ctx, query)
+func (r *Repository) ListMenus(ctx context.Context, tx pgx.Tx) ([]Menu, error) {
+	rows, err := tx.Query(ctx, menusSelect)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return scanMenus(rows)
+}
 
-	var menus []Menu
-	for rows.Next() {
-		var m Menu
-		if err := rows.Scan(&m.ID, &m.Name, &m.Label, &m.Path, &m.SortOrder, &m.IsActive); err != nil {
-			return nil, err
-		}
-		menus = append(menus, m)
+func (r *Repository) ListMenusDirect(ctx context.Context) ([]Menu, error) {
+	rows, err := r.pool.Query(ctx, menusSelect)
+	if err != nil {
+		return nil, err
 	}
-	return menus, rows.Err()
+	return scanMenus(rows)
+}
+
+func (r *Repository) ListMenusForUser(ctx context.Context, tx pgx.Tx, userID int64, isSuperAdmin bool) ([]Menu, error) {
+	if isSuperAdmin {
+		if tx != nil {
+			return r.ListMenus(ctx, tx)
+		}
+		return r.ListMenusDirect(ctx)
+	}
+
+	query := `
+		SELECT DISTINCT m.id, m.name, m.label, COALESCE(m.icon,''), COALESCE(m.path,''), m.sort_order,
+		       COALESCE(m.is_active, true), COALESCE(m.group_name, 'content'), COALESCE(m.api_prefix, '')
+		FROM menus m
+		JOIN menu_actions ma ON ma.menu_id = m.id AND UPPER(ma.action) = 'VIEW'
+		WHERE m.is_active IS NOT FALSE
+		  AND (
+		    EXISTS (
+		      SELECT 1 FROM users u WHERE u.id = $1 AND u.is_super_admin = TRUE AND u.is_active = TRUE
+		    )
+		    OR EXISTS (
+		      SELECT 1
+		      FROM user_roles ur
+		      JOIN role_menu_actions rma ON rma.role_id = ur.role_id
+		      WHERE ur.user_id = $1 AND ur.is_active = TRUE AND rma.menu_action_id = ma.id
+		    )
+		    OR EXISTS (
+		      SELECT 1 FROM user_permission_overrides upo
+		      WHERE upo.user_id = $1 AND upo.menu_action_id = ma.id AND upo.is_active = TRUE
+		        AND upo.effect = 'GRANT'
+		        AND (upo.valid_from IS NULL OR upo.valid_from <= NOW())
+		        AND (upo.valid_until IS NULL OR upo.valid_until > NOW())
+		    )
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM user_permission_overrides upo
+		    WHERE upo.user_id = $1 AND upo.menu_action_id = ma.id AND upo.is_active = TRUE
+		      AND upo.effect = 'REVOKE'
+		      AND (upo.valid_from IS NULL OR upo.valid_from <= NOW())
+		      AND (upo.valid_until IS NULL OR upo.valid_until > NOW())
+		  )
+		ORDER BY m.sort_order ASC, m.id ASC
+	`
+	var rows pgx.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.Query(ctx, query, userID)
+	} else {
+		rows, err = r.pool.Query(ctx, query, userID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return scanMenus(rows)
 }
 
 func (r *Repository) ListMenuActions(ctx context.Context, tx pgx.Tx, menuID int) ([]MenuAction, error) {
@@ -531,9 +579,16 @@ func (r *Repository) ListMenuActions(ctx context.Context, tx pgx.Tx, menuID int)
 // ─── User Role Mapping ────────────────────────
 
 func (r *Repository) AssignUserRole(ctx context.Context, tx pgx.Tx, userID int64, roleID int, assignedBy int64) error {
+	return r.ReplaceUserRole(ctx, tx, userID, roleID, assignedBy)
+}
+
+func (r *Repository) ReplaceUserRole(ctx context.Context, tx pgx.Tx, userID int64, roleID int, assignedBy int64) error {
+	if _, err := tx.Exec(ctx, `UPDATE user_roles SET is_active = FALSE WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
 	query := `
-		INSERT INTO user_roles (user_id, role_id, assigned_by)
-		VALUES ($1, $2, $3)
+		INSERT INTO user_roles (user_id, role_id, is_active, assigned_by)
+		VALUES ($1, $2, TRUE, $3)
 		ON CONFLICT (user_id, role_id)
 		DO UPDATE SET assigned_by = EXCLUDED.assigned_by, is_active = TRUE
 	`
@@ -623,12 +678,13 @@ func (r *Repository) GetUserEffectivePermissions(ctx context.Context, tx pgx.Tx,
 
 	var roleNames []string
 	var isSuperAdmin bool
+	_ = tx.QueryRow(ctx, `SELECT COALESCE(is_super_admin, FALSE) FROM users WHERE id = $1`, userID).Scan(&isSuperAdmin)
 	for rRows.Next() {
 		var roleID int
 		var roleName string
 		if err := rRows.Scan(&roleID, &roleName); err == nil {
 			roleNames = append(roleNames, roleName)
-			if roleID == 1 || strings.EqualFold(roleName, "Super Administrator") {
+			if strings.EqualFold(roleName, "super_admin") || strings.EqualFold(roleName, "Super Administrator") {
 				isSuperAdmin = true
 			}
 		}
@@ -687,6 +743,24 @@ func (r *Repository) GetUserEffectivePermissions(ctx context.Context, tx pgx.Tx,
 		permsList = append(permsList, p)
 	}
 
+	if isSuperAdmin {
+		allRows, err := tx.Query(ctx, `SELECT DISTINCT (m.name || '.' || ma.action) FROM menus m JOIN menu_actions ma ON ma.menu_id = m.id WHERE m.is_active IS NOT FALSE`)
+		if err == nil {
+			defer allRows.Close()
+			permMap = map[string]bool{}
+			for allRows.Next() {
+				var p string
+				if allRows.Scan(&p) == nil {
+					permMap[p] = true
+				}
+			}
+			permsList = permsList[:0]
+			for p := range permMap {
+				permsList = append(permsList, p)
+			}
+		}
+	}
+
 	// 4. Fetch Category Scopes
 	catScopes, _ := r.GetUserCategoryScopes(ctx, tx, userID)
 
@@ -711,7 +785,7 @@ func (r *Repository) HasRoleGrant(ctx context.Context, tx pgx.Tx, userID int64, 
 			JOIN menus m ON m.id = ma.menu_id
 			WHERE ur.user_id = $1
 			  AND ur.is_active = TRUE
-			  AND (m.name || '.' || ma.action) = $2
+			AND UPPER(m.name || '.' || ma.action) = UPPER($2)
 		)
 	`
 	var hasGrant bool
@@ -726,7 +800,7 @@ func (r *Repository) FindActiveOverride(ctx context.Context, tx pgx.Tx, userID i
 		JOIN menu_actions ma ON ma.id = upo.menu_action_id
 		JOIN menus m ON m.id = ma.menu_id
 		WHERE upo.user_id = $1
-		  AND (m.name || '.' || ma.action) = $2
+		  AND UPPER(m.name || '.' || ma.action) = UPPER($2)
 		  AND upo.is_active = TRUE
 		  AND (upo.valid_from IS NULL OR upo.valid_from <= NOW())
 		  AND (upo.valid_until IS NULL OR upo.valid_until > NOW())
@@ -855,7 +929,7 @@ func (r *Repository) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset
 
 func (r *Repository) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search string) ([]StaffUserRoleSummary, error) {
 	query := `
-		SELECT u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
+		SELECT DISTINCT ON (u.id) u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
 		       u.is_super_admin, u.is_active,
 		       r.id, r.name
 		FROM users u
@@ -867,10 +941,10 @@ func (r *Repository) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search s
 	var err error
 	if strings.TrimSpace(search) != "" {
 		query += ` AND (u.display_name ILIKE $1 OR u.email ILIKE $1)
-		           ORDER BY u.is_super_admin DESC, u.id ASC`
+		           ORDER BY u.id ASC, u.is_super_admin DESC`
 		rows, err = tx.Query(ctx, query, "%"+strings.TrimSpace(search)+"%")
 	} else {
-		query += ` ORDER BY u.is_super_admin DESC, u.id ASC`
+		query += ` ORDER BY u.id ASC, u.is_super_admin DESC`
 		rows, err = tx.Query(ctx, query)
 	}
 	if err != nil {
@@ -904,7 +978,7 @@ func (r *Repository) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search s
 
 func (r *Repository) ListStaffWithRolesDirect(ctx context.Context, search string) ([]StaffUserRoleSummary, error) {
 	query := `
-		SELECT u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
+		SELECT DISTINCT ON (u.id) u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
 		       u.is_super_admin, u.is_active,
 		       r.id, r.name
 		FROM users u
@@ -916,10 +990,10 @@ func (r *Repository) ListStaffWithRolesDirect(ctx context.Context, search string
 	var err error
 	if strings.TrimSpace(search) != "" {
 		query += ` AND (u.display_name ILIKE $1 OR u.email ILIKE $1)
-		           ORDER BY u.is_super_admin DESC, u.id ASC`
+		           ORDER BY u.id ASC, u.is_super_admin DESC`
 		rows, err = r.pool.Query(ctx, query, "%"+strings.TrimSpace(search)+"%")
 	} else {
-		query += ` ORDER BY u.is_super_admin DESC, u.id ASC`
+		query += ` ORDER BY u.id ASC, u.is_super_admin DESC`
 		rows, err = r.pool.Query(ctx, query)
 	}
 	if err != nil {

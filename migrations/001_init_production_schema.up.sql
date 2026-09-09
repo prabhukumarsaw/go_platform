@@ -124,7 +124,9 @@ CREATE TABLE IF NOT EXISTS menus (
     path VARCHAR(255) DEFAULT '',
     parent_id INT REFERENCES menus(id) ON DELETE SET NULL,
     sort_order INT DEFAULT 0,
-    is_active BOOLEAN DEFAULT TRUE
+    is_active BOOLEAN DEFAULT TRUE,
+    group_name VARCHAR(50) DEFAULT 'content',
+    api_prefix TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS menu_actions (
@@ -145,6 +147,7 @@ CREATE TABLE IF NOT EXISTS user_roles (
     user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
     role_id INT REFERENCES roles(id) ON DELETE CASCADE,
     is_active BOOLEAN DEFAULT TRUE,
+    assigned_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY(user_id, role_id)
 );
@@ -195,6 +198,8 @@ CREATE TABLE IF NOT EXISTS user_permission_overrides (
     is_active BOOLEAN DEFAULT TRUE,
     valid_from TIMESTAMPTZ,
     valid_until TIMESTAMPTZ,
+    reason TEXT DEFAULT '',
+    granted_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -471,29 +476,31 @@ CREATE TABLE IF NOT EXISTS sponsored_articles (
 -- ──────────────────────────────────────────────
 
 -- 9.1 Active Synchronized Navigation Menus (Exact 1-to-1 Match with Panel Routes)
-INSERT INTO menus (name, label, icon, path, sort_order, is_active) VALUES
-    ('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE),
-    ('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE),
-    ('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE),
-    ('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE),
-    ('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE),
-    ('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE),
-    ('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE),
-    ('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE),
-    ('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE),
-    ('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE),
-    ('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE),
-    ('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE),
-    ('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE),
-    ('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE),
-    ('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE),
-    ('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE)
+INSERT INTO menus (name, label, icon, path, sort_order, is_active, group_name, api_prefix) VALUES
+    ('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE, 'content',    ''),
+    ('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE, 'content',    '/studio/articles,/studio/stories'),
+    ('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE, 'content',    '/studio/categories'),
+    ('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE, 'content',    '/studio/homepage'),
+    ('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE, 'content',    '/studio/tags'),
+    ('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE, 'content',    '/media,/studio/media'),
+    ('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE, 'content',    '/studio/live-blogs'),
+    ('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE, 'content',    '/admin/notifications,/notifications'),
+    ('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE, 'management', ''),
+    ('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE, 'management', '/admin/employees'),
+    ('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE, 'management', '/admin/moderation,/moderation'),
+    ('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE, 'management', '/admin/analytics'),
+    ('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE, 'management', '/iam,/roles'),
+    ('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE, 'management', '/admin/settings'),
+    ('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE, 'management', '/iam/audit-log'),
+    ('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE, 'management', '/admin/seo')
 ON CONFLICT (name) DO UPDATE SET
     label      = EXCLUDED.label,
     icon       = EXCLUDED.icon,
     path       = EXCLUDED.path,
     sort_order = EXCLUDED.sort_order,
-    is_active  = EXCLUDED.is_active;
+    is_active  = EXCLUDED.is_active,
+    group_name = EXCLUDED.group_name,
+    api_prefix = EXCLUDED.api_prefix;
 
 -- 9.2 Menu Actions Generation
 DO $$
@@ -524,18 +531,30 @@ INSERT INTO role_menu_actions (role_id, menu_action_id)
 SELECT r.id, ma.id FROM roles r CROSS JOIN menu_actions ma WHERE r.name = 'super_admin'
 ON CONFLICT DO NOTHING;
 
--- editor: VIEW, ADD, EDIT, PUBLISH on all menus
+-- editor: editorial desks only (not IAM / settings / audit)
 INSERT INTO role_menu_actions (role_id, menu_action_id)
 SELECT r.id, ma.id FROM roles r
 JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT','PUBLISH')
+JOIN menus m ON m.id = ma.menu_id AND m.name IN (
+    'dashboard','articles','categories','homepage','tags','media_library','live_blogs','notifications','comments','analytics'
+)
 WHERE r.name = 'editor'
 ON CONFLICT DO NOTHING;
 
--- reporter: VIEW, ADD, EDIT
+-- reporter: drafts and media only
 INSERT INTO role_menu_actions (role_id, menu_action_id)
 SELECT r.id, ma.id FROM roles r
 JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+JOIN menus m ON m.id = ma.menu_id AND m.name IN ('dashboard','articles','media_library','tags','categories')
 WHERE r.name = 'reporter'
+ON CONFLICT DO NOTHING;
+
+-- sub_editor: VIEW, ADD, EDIT on editorial desks
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r
+JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+JOIN menus m ON m.id = ma.menu_id AND m.name IN ('dashboard','articles','categories','tags','media_library','live_blogs','comments')
+WHERE r.name = 'sub_editor'
 ON CONFLICT DO NOTHING;
 
 -- moderator: VIEW, APPROVE, DELETE on comments and audit
@@ -544,6 +563,13 @@ SELECT r.id, ma.id FROM roles r
 JOIN menu_actions ma ON ma.action IN ('VIEW','APPROVE','DELETE')
 JOIN menus m ON m.id = ma.menu_id AND m.name IN ('comments', 'audit')
 WHERE r.name = 'moderator'
+ON CONFLICT DO NOTHING;
+
+-- Every staff role can open the dashboard
+INSERT INTO role_menu_actions (role_id, menu_action_id)
+SELECT r.id, ma.id FROM roles r
+JOIN menu_actions ma ON ma.action = 'VIEW'
+JOIN menus m ON m.id = ma.menu_id AND m.name = 'dashboard'
 ON CONFLICT DO NOTHING;
 
 -- 9.5 Production Superadmin Account (admin123)

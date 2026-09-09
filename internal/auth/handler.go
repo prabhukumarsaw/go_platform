@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"newsplatform/api/pkg/config"
 	"newsplatform/api/pkg/middleware"
 	"newsplatform/api/pkg/response"
@@ -21,7 +22,7 @@ func NewHandler(service *Service) *Handler {
 }
 
 // RegisterRoutes registers auth routes (public and session-authenticated).
-func (h *Handler) RegisterRoutes(router fiber.Router, jwtCfg config.JWTConfig) {
+func (h *Handler) RegisterRoutes(router fiber.Router, jwtCfg config.JWTConfig, pool *pgxpool.Pool) {
 	auth := router.Group("/auth")
 
 	auth.Post("/register", h.Register)
@@ -34,8 +35,8 @@ func (h *Handler) RegisterRoutes(router fiber.Router, jwtCfg config.JWTConfig) {
 	auth.Post("/otp/verify", h.VerifyOTP)
 	auth.Post("/google/callback", h.GoogleCallback)
 
-	// Authenticated routes
-	authReq := auth.Group("", middleware.RequireAuth(jwtCfg))
+	// Authenticated routes — pool is required so deactivated accounts are rejected
+	authReq := auth.Group("", middleware.RequireAuth(jwtCfg, pool))
 	authReq.Get("/me", h.GetMe)
 	authReq.Get("/sessions", h.ListSessions)
 	authReq.Delete("/sessions/:id", h.RevokeSession)
@@ -291,6 +292,9 @@ func (h *Handler) GetMe(c *fiber.Ctx) error {
 	user, err := h.service.GetUserByID(c.Context(), sess.UserID)
 	if err != nil {
 		return response.InternalError(c, "Failed to load user profile")
+	}
+	if user == nil || !user.IsActive {
+		return response.Unauthorized(c, "Account is disabled")
 	}
 
 	return response.Success(c, fiber.Map{

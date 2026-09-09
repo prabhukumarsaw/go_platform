@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,12 +31,12 @@ func hashPassword(password string) string {
 
 func (r *Repository) ListEmployees(ctx context.Context, tx pgx.Tx, department, search string) ([]Employee, error) {
 	query := `
-		SELECT e.id, e.user_id,
+		SELECT DISTINCT ON (e.id) e.id, e.user_id,
 		       e.employee_code, u.display_name, COALESCE(u.email, ''), COALESCE(u.phone, ''), COALESCE(u.avatar_url, ''),
 		       e.department, e.designation,
 		       ro.id as role_id, COALESCE(ro.name, '') as role_name,
 		       COALESCE(e.address, ''), COALESCE(e.pin_code, ''), COALESCE(e.bio, ''), COALESCE(e.press_card_no, ''), COALESCE(e.x_handle, ''),
-		       e.is_active,
+		       (e.is_active AND u.is_active) as is_active,
 		       COALESCE(ac.count, 0) as article_count,
 		       COALESCE(vc.views, 0) as total_views,
 		       e.joined_at, e.created_at
@@ -67,7 +68,7 @@ func (r *Repository) ListEmployees(ctx context.Context, tx pgx.Tx, department, s
 		argIdx++
 	}
 
-	query += " ORDER BY e.id ASC"
+	query += " ORDER BY e.id ASC, ro.id ASC NULLS LAST"
 
 	var rows pgx.Rows
 	var err error
@@ -203,6 +204,14 @@ func (r *Repository) OnboardEmployee(ctx context.Context, tx pgx.Tx, input Onboa
 		}
 	}
 
+	if input.EmployeeCode == "" {
+		code, err := r.NextEmployeeCode(ctx, tx)
+		if err != nil {
+			return nil, fmt.Errorf("generate employee code: %w", err)
+		}
+		input.EmployeeCode = code
+	}
+
 	// 2. Insert or update employee record
 	_, _ = tx.Exec(ctx, "SELECT setval('employees_id_seq', (SELECT COALESCE(MAX(id), 1) FROM employees) + 1, false)")
 
@@ -241,11 +250,12 @@ func (r *Repository) OnboardEmployee(ctx context.Context, tx pgx.Tx, input Onboa
 	emp.Phone = input.Phone
 	emp.AvatarURL = input.AvatarURL
 
-	// 3. Assign staff role mapping in user_roles
+	// 3. Assign staff role mapping in user_roles (single active role)
 	if input.RoleID > 0 {
+		_, _ = tx.Exec(ctx, `UPDATE user_roles SET is_active = FALSE WHERE user_id = $1`, input.UserID)
 		_, _ = tx.Exec(ctx, `
-			INSERT INTO user_roles (user_id, role_id, is_active)
-			VALUES ($1, $2, TRUE)
+			INSERT INTO user_roles (user_id, role_id, is_active, assigned_by)
+			VALUES ($1, $2, TRUE, $1)
 			ON CONFLICT (user_id, role_id) DO UPDATE SET is_active = TRUE
 		`, input.UserID, input.RoleID)
 		emp.RoleID = &input.RoleID
@@ -258,13 +268,40 @@ func (r *Repository) OnboardEmployee(ctx context.Context, tx pgx.Tx, input Onboa
 }
 
 func (r *Repository) UpdateStatus(ctx context.Context, tx pgx.Tx, employeeID int64, isActive bool) error {
-	var err error
+	// Update employee record
+	var employeeErr error
 	if tx != nil {
-		_, err = tx.Exec(ctx, "UPDATE employees SET is_active = $1, updated_at = NOW() WHERE id = $2", isActive, employeeID)
+		_, employeeErr = tx.Exec(ctx, "UPDATE employees SET is_active = $1, updated_at = NOW() WHERE id = $2", isActive, employeeID)
 	} else {
-		_, err = r.pool.Exec(ctx, "UPDATE employees SET is_active = $1, updated_at = NOW() WHERE id = $2", isActive, employeeID)
+		_, employeeErr = r.pool.Exec(ctx, "UPDATE employees SET is_active = $1, updated_at = NOW() WHERE id = $2", isActive, employeeID)
 	}
-	return err
+	if employeeErr != nil {
+		return employeeErr
+	}
+
+	// SECURITY: also update users.is_active so the user cannot login / refresh tokens
+	q := `UPDATE users SET is_active = $1 WHERE id = (
+		SELECT user_id FROM employees WHERE id = $2
+	)`
+	if tx != nil {
+		_, employeeErr = tx.Exec(ctx, q, isActive, employeeID)
+	} else {
+		_, employeeErr = r.pool.Exec(ctx, q, isActive, employeeID)
+	}
+	if employeeErr != nil {
+		return employeeErr
+	}
+
+	// Kill existing sessions so a deactivated user cannot stay signed in
+	revoke := `UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = (
+		SELECT user_id FROM employees WHERE id = $1
+	)`
+	if tx != nil {
+		_, _ = tx.Exec(ctx, revoke, employeeID)
+	} else {
+		_, _ = r.pool.Exec(ctx, revoke, employeeID)
+	}
+	return nil
 }
 
 func (r *Repository) Delete(ctx context.Context, tx pgx.Tx, employeeID int64) error {
@@ -273,6 +310,124 @@ func (r *Repository) Delete(ctx context.Context, tx pgx.Tx, employeeID int64) er
 		_, err = tx.Exec(ctx, "DELETE FROM employees WHERE id = $1", employeeID)
 	} else {
 		_, err = r.pool.Exec(ctx, "DELETE FROM employees WHERE id = $1", employeeID)
+	}
+	return err
+}
+
+// UpdateEmployee updates editable profile fields on an existing employee.
+func (r *Repository) UpdateEmployee(ctx context.Context, tx pgx.Tx, employeeID int64, input UpdateEmployeeInput) (*Employee, error) {
+	// Update users table for display_name, phone, avatar_url
+	userQuery := `
+		UPDATE users SET
+			display_name = COALESCE(NULLIF($1, ''), display_name),
+			phone = COALESCE(NULLIF($2, ''), phone),
+			avatar_url = COALESCE(NULLIF($3, ''), avatar_url)
+		WHERE id = (SELECT user_id FROM employees WHERE id = $4)
+	`
+	if tx != nil {
+		_, _ = tx.Exec(ctx, userQuery, input.DisplayName, input.Phone, input.AvatarURL, employeeID)
+	} else {
+		_, _ = r.pool.Exec(ctx, userQuery, input.DisplayName, input.Phone, input.AvatarURL, employeeID)
+	}
+
+	// Update employees table
+	empQuery := `
+		UPDATE employees SET
+			department = COALESCE(NULLIF($1, ''), department),
+			designation = COALESCE(NULLIF($2, ''), designation),
+			address = COALESCE(NULLIF($3, ''), address),
+			pin_code = COALESCE(NULLIF($4, ''), pin_code),
+			bio = COALESCE(NULLIF($5, ''), bio),
+			press_card_no = COALESCE(NULLIF($6, ''), press_card_no),
+			x_handle = COALESCE(NULLIF($7, ''), x_handle),
+			updated_at = NOW()
+		WHERE id = $8
+		RETURNING id
+	`
+	var returnedID int64
+	var err error
+	if tx != nil {
+		err = tx.QueryRow(ctx, empQuery,
+			input.Department, input.Designation,
+			input.Address, input.PinCode, input.Bio,
+			input.PressCardNo, input.XHandle, employeeID,
+		).Scan(&returnedID)
+	} else {
+		err = r.pool.QueryRow(ctx, empQuery,
+			input.Department, input.Designation,
+			input.Address, input.PinCode, input.Bio,
+			input.PressCardNo, input.XHandle, employeeID,
+		).Scan(&returnedID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("update employee: %w", err)
+	}
+
+	if input.RoleID != nil && *input.RoleID > 0 {
+		if err := r.AssignRole(ctx, tx, employeeID, *input.RoleID); err != nil {
+			return nil, fmt.Errorf("assign role: %w", err)
+		}
+	}
+
+	return r.GetEmployeeByID(ctx, tx, employeeID)
+}
+
+func (r *Repository) NextEmployeeCode(ctx context.Context, tx pgx.Tx) (string, error) {
+	year := time.Now().Year()
+	prefix := fmt.Sprintf("EMP-%d-", year)
+	var next int
+	q := `
+		SELECT COALESCE(MAX(
+			NULLIF(regexp_replace(employee_code, '^EMP-[0-9]{4}-', ''), '')::int
+		), 0) + 1
+		FROM employees
+		WHERE employee_code LIKE $1
+	`
+	like := prefix + "%"
+	var err error
+	if tx != nil {
+		err = tx.QueryRow(ctx, q, like).Scan(&next)
+	} else {
+		err = r.pool.QueryRow(ctx, q, like).Scan(&next)
+	}
+	if err != nil {
+		next = 1
+	}
+	return fmt.Sprintf("EMP-%d-%04d", year, next), nil
+}
+
+// AssignRole assigns a new IAM role to an employee (replaces existing role).
+func (r *Repository) AssignRole(ctx context.Context, tx pgx.Tx, employeeID int64, roleID int) error {
+	// First get the user_id for this employee
+	var userID int64
+	var err error
+	if tx != nil {
+		err = tx.QueryRow(ctx, "SELECT user_id FROM employees WHERE id = $1", employeeID).Scan(&userID)
+	} else {
+		err = r.pool.QueryRow(ctx, "SELECT user_id FROM employees WHERE id = $1", employeeID).Scan(&userID)
+	}
+	if err != nil {
+		return fmt.Errorf("employee not found: %w", err)
+	}
+
+	// Deactivate previous roles
+	if tx != nil {
+		_, err = tx.Exec(ctx, "UPDATE user_roles SET is_active = FALSE WHERE user_id = $1", userID)
+	} else {
+		_, err = r.pool.Exec(ctx, "UPDATE user_roles SET is_active = FALSE WHERE user_id = $1", userID)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Assign new role
+	q := `INSERT INTO user_roles (user_id, role_id, is_active, assigned_by)
+		VALUES ($1, $2, TRUE, 1)
+		ON CONFLICT (user_id, role_id) DO UPDATE SET is_active = TRUE, assigned_by = 1`
+	if tx != nil {
+		_, err = tx.Exec(ctx, q, userID, roleID)
+	} else {
+		_, err = r.pool.Exec(ctx, q, userID, roleID)
 	}
 	return err
 }

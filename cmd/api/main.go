@@ -187,6 +187,11 @@ func main() {
 		// menus table
 		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS icon VARCHAR(100) DEFAULT ''`,
 		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS parent_id INT REFERENCES menus(id) ON DELETE SET NULL`,
+		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS group_name VARCHAR(50) DEFAULT 'content'`,
+		`ALTER TABLE menus ADD COLUMN IF NOT EXISTS api_prefix TEXT DEFAULT ''`,
+		`ALTER TABLE user_roles ADD COLUMN IF NOT EXISTS assigned_by BIGINT REFERENCES users(id) ON DELETE SET NULL`,
+		`ALTER TABLE user_permission_overrides ADD COLUMN IF NOT EXISTS reason TEXT DEFAULT ''`,
+		`ALTER TABLE user_permission_overrides ADD COLUMN IF NOT EXISTS granted_by BIGINT REFERENCES users(id) ON DELETE SET NULL`,
 		// menu_actions table
 		`ALTER TABLE menu_actions ADD COLUMN IF NOT EXISTS label VARCHAR(150) DEFAULT ''`,
 		// permission_audit_log table
@@ -203,9 +208,9 @@ func main() {
 			created_at      TIMESTAMPTZ DEFAULT NOW()
 		)`,
 		// Auto-enroll superadmin and staff into employees if missing
-		`INSERT INTO employees (user_id, employee_code, department, designation, bio, press_card_no, is_active)
+		`		INSERT INTO employees (user_id, employee_code, department, designation, bio, press_card_no, is_active)
 		SELECT u.id,
-		       'EMP-' || LPAD(u.id::text, 4, '0'),
+		       'EMP-' || TO_CHAR(NOW(), 'YYYY') || '-' || LPAD(u.id::text, 4, '0'),
 		       'Editorial',
 		       CASE WHEN u.is_super_admin THEN 'Chief Editor' ELSE 'Staff Member' END,
 		       CASE WHEN u.is_super_admin THEN 'Platform Chief Editor & Root Administrator' ELSE 'Newsroom staff member' END,
@@ -225,29 +230,31 @@ func main() {
 	// ─── IAM Seed: ensure menus, roles, actions & grants exist ───────────────
 	_, _ = pool.Exec(ctx, `
 		-- Ensure all active newsroom menus exist
-		INSERT INTO menus (name, label, icon, path, sort_order, is_active) VALUES
-			('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE),
-			('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE),
-			('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE),
-			('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE),
-			('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE),
-			('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE),
-			('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE),
-			('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE),
-			('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE),
-			('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE),
-			('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE),
-			('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE),
-			('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE),
-			('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE),
-			('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE),
-			('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE)
+		INSERT INTO menus (name, label, icon, path, sort_order, is_active, group_name, api_prefix) VALUES
+			('dashboard',     'Dashboard',                 'LayoutDashboard', '/panel/dashboard',     1,  TRUE, 'content',    ''),
+			('articles',      'Articles',                  'FileText',        '/panel/articles',      2,  TRUE, 'content',    '/studio/articles,/studio/stories,/studio/ai'),
+			('categories',    'Categories',                'Tag',             '/panel/categories',    3,  TRUE, 'content',    '/studio/categories'),
+			('homepage',      'Home Categories & Layout',  'LayoutGrid',      '/panel/homepage',      4,  TRUE, 'content',    '/studio/homepage'),
+			('tags',          'Tags',                      'Hash',            '/panel/tags',          5,  TRUE, 'content',    '/studio/tags'),
+			('media_library', 'Media',                     'Image',           '/panel/media',         6,  TRUE, 'content',    '/media,/studio/media'),
+			('live_blogs',    'Live Blog',                 'Radio',           '/panel/liveblog',      7,  TRUE, 'content',    '/studio/live-blogs'),
+			('notifications', 'Broadcast & Alerts',        'Bell',            '/panel/notifications', 8,  TRUE, 'content',    '/admin/notifications,/notifications'),
+			('reports',       'Reports',                   'BarChart2',       '/panel/reports',       9,  TRUE, 'management', ''),
+			('users',         'Team & Staff',              'Users',           '/panel/users',         10, TRUE, 'management', '/admin/employees'),
+			('comments',      'Comments',                  'MessageSquare',   '/panel/comments',      11, TRUE, 'management', '/admin/moderation,/moderation'),
+			('analytics',     'Analytics',                 'TrendingUp',      '/panel/analytics',     12, TRUE, 'management', '/admin/analytics'),
+			('roles',         'Roles & Permissions',       'Lock',            '/panel/roles',         13, TRUE, 'management', '/iam,/roles'),
+			('settings',      'Settings',                  'Settings',        '/panel/settings',      14, TRUE, 'management', '/admin/settings'),
+			('audit',         'Audit Log',                 'Shield',          '/panel/audit',         15, TRUE, 'management', '/iam/audit-log'),
+			('seo',           'SEO Management',            'Search',          '/panel/seo',           16, TRUE, 'management', '/admin/seo')
 		ON CONFLICT (name) DO UPDATE SET
 			label      = EXCLUDED.label,
 			icon       = EXCLUDED.icon,
 			path       = EXCLUDED.path,
 			sort_order = EXCLUDED.sort_order,
-			is_active  = EXCLUDED.is_active;
+			is_active  = EXCLUDED.is_active,
+			group_name = EXCLUDED.group_name,
+			api_prefix = EXCLUDED.api_prefix;
 
 		-- Deactivate obsolete/duplicate menus
 		UPDATE menus SET is_active = FALSE WHERE name IN ('employees', 'polls', 'moderation', 'ads', 'web_stories', 'e_paper');
@@ -280,18 +287,35 @@ func main() {
 		SELECT r.id, ma.id FROM roles r CROSS JOIN menu_actions ma WHERE r.name = 'super_admin'
 		ON CONFLICT DO NOTHING;
 
-		-- Grant VIEW+ADD+EDIT+PUBLISH to editor
+		-- Rebuild system-role grants so matrix matches real newsroom desks (not "all menus")
+		DELETE FROM role_menu_actions rma
+		USING roles r
+		WHERE rma.role_id = r.id AND r.is_system = TRUE AND r.name <> 'super_admin';
+
+		-- editor: publish across editorial surfaces, no IAM/settings/audit
 		INSERT INTO role_menu_actions (role_id, menu_action_id)
 		SELECT r.id, ma.id FROM roles r
 		JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT','PUBLISH')
+		JOIN menus m ON m.id = ma.menu_id AND m.name IN (
+			'dashboard','articles','categories','homepage','tags','media_library','live_blogs','notifications','comments','analytics'
+		)
 		WHERE r.name = 'editor'
 		ON CONFLICT DO NOTHING;
 
-		-- Grant VIEW+ADD+EDIT to reporter
+		-- reporter: draft and media only
 		INSERT INTO role_menu_actions (role_id, menu_action_id)
 		SELECT r.id, ma.id FROM roles r
 		JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+		JOIN menus m ON m.id = ma.menu_id AND m.name IN ('dashboard','articles','media_library','tags','categories')
 		WHERE r.name = 'reporter'
+		ON CONFLICT DO NOTHING;
+
+		-- Grant VIEW+ADD+EDIT on editorial menus to sub_editor
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r
+		JOIN menu_actions ma ON ma.action IN ('VIEW','ADD','EDIT')
+		JOIN menus m ON m.id = ma.menu_id AND m.name IN ('dashboard','articles','categories','tags','media_library','live_blogs','comments')
+		WHERE r.name = 'sub_editor'
 		ON CONFLICT DO NOTHING;
 
 		-- Grant VIEW+APPROVE+DELETE on comments/moderation to moderator
@@ -300,6 +324,13 @@ func main() {
 		JOIN menu_actions ma ON ma.action IN ('VIEW','APPROVE','DELETE')
 		JOIN menus m ON m.id = ma.menu_id AND m.name IN ('comments','moderation','articles')
 		WHERE r.name = 'moderator'
+		ON CONFLICT DO NOTHING;
+
+		-- Every staff role can at least open the dashboard shell
+		INSERT INTO role_menu_actions (role_id, menu_action_id)
+		SELECT r.id, ma.id FROM roles r
+		JOIN menu_actions ma ON ma.action = 'VIEW'
+		JOIN menus m ON m.id = ma.menu_id AND m.name = 'dashboard'
 		ON CONFLICT DO NOTHING;
 	`)
 

@@ -140,6 +140,10 @@ func (s *Service) AuthenticateGoogle(ctx context.Context, code string) (*TokenPa
 		return nil, nil, err
 	}
 
+	if !user.IsActive {
+		return nil, nil, fmt.Errorf("account is disabled")
+	}
+
 	roles, err := s.getUserRoles(ctx, tx, user.ID)
 	if err != nil {
 		return nil, nil, err

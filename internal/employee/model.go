@@ -59,3 +59,18 @@ type OnboardEmployeeInput struct {
 	PressCardNo  string     `json:"press_card_no"`
 	XHandle      string     `json:"x_handle"`
 }
+
+// UpdateEmployeeInput holds editable fields for an existing employee.
+type UpdateEmployeeInput struct {
+	DisplayName  string     `json:"display_name"`
+	Phone        string     `json:"phone"`
+	AvatarURL    string     `json:"avatar_url"`
+	Department   Department `json:"department"`
+	Designation  string     `json:"designation"`
+	Address      string     `json:"address"`
+	PinCode      string     `json:"pin_code"`
+	Bio          string     `json:"bio"`
+	PressCardNo  string     `json:"press_card_no"`
+	XHandle      string     `json:"x_handle"`
+	RoleID       *int       `json:"role_id,omitempty"`
+}

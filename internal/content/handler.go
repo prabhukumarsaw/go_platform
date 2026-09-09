@@ -60,6 +60,7 @@ func (h *Handler) RegisterStudioRoutes(router fiber.Router) {
 	studio.Get("/:id", h.GetArticle)
 	studio.Put("/:id", h.UpdateArticle)
 	studio.Patch("/:id", h.UpdateArticle)
+	studio.Delete("/:id", h.DeleteArticle)
 	studio.Post("/:id/transition", h.TransitionStatus)
 	studio.Post("/:id/schedule", h.ScheduleArticle)
 	studio.Get("/:id/versions", h.GetArticleVersions)
@@ -603,6 +604,47 @@ func (h *Handler) GetArticleVersions(c *fiber.Ctx) error {
 	}
 
 	return response.Success(c, versions)
+}
+
+// DeleteArticle permanently deletes an article (draft only; super admin can delete any).
+func (h *Handler) DeleteArticle(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
+	tx := c.Locals("tx").(pgx.Tx)
+
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid article ID format")
+	}
+
+	// Check ownership / status before deleting
+	var authorID int64
+	var status string
+	err = tx.QueryRow(c.Context(),
+		"SELECT author_id, status FROM articles WHERE id = $1", id,
+	).Scan(&authorID, &status)
+	if err == pgx.ErrNoRows {
+		return response.NotFound(c, "Article not found")
+	}
+	if err != nil {
+		return response.InternalError(c, "Failed to lookup article")
+	}
+
+	// Only superadmin can delete published/archived articles; others only their own drafts
+	if sess != nil && !sess.IsSuperAdmin {
+		if authorID != sess.UserID {
+			return response.Forbidden(c, "You can only delete your own articles")
+		}
+		if status == "published" {
+			return response.Forbidden(c, "Published articles cannot be deleted. Use the transition workflow to archive first.")
+		}
+	}
+
+	_, err = tx.Exec(c.Context(), "DELETE FROM articles WHERE id = $1", id)
+	if err != nil {
+		return response.InternalError(c, "Failed to delete article: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Article deleted successfully"})
 }
 
 // ─── Stories & Live Blogs ───────────────────────

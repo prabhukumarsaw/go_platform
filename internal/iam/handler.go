@@ -56,6 +56,7 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 		// 4. Effective Permissions
 		iam.Get("/users/:userId/permissions", h.GetUserEffectivePermissions)
 		iam.Get("/me/permissions", h.GetMyEffectivePermissions)
+		iam.Get("/me/menus", h.ListMyMenus)
 
 		// 5. Overrides & ABAC Policies
 		iam.Post("/overrides", h.CreateOverride)
@@ -224,14 +225,40 @@ func (h *Handler) AssignRolePermissions(c *fiber.Ctx) error {
 }
 
 func (h *Handler) ListMenus(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
 	var menus []Menu
 	var err error
-	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+
+	if sess != nil {
+		if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+			menus, err = h.service.ListMenusForUser(c.Context(), tx, sess.UserID, sess.IsSuperAdmin)
+		} else {
+			menus, err = h.service.ListMenusForUser(c.Context(), nil, sess.UserID, sess.IsSuperAdmin)
+		}
+	} else if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
 		menus, err = h.service.ListMenus(c.Context(), tx)
 	} else {
 		menus, err = h.service.ListMenusDirect(c.Context())
 	}
 
+	if err != nil {
+		return response.InternalError(c, "Failed to list menus: "+err.Error())
+	}
+	return response.Success(c, menus)
+}
+
+func (h *Handler) ListMyMenus(c *fiber.Ctx) error {
+	sess := middleware.SessionFromCtx(c)
+	if sess == nil {
+		return response.Unauthorized(c, "Authentication required")
+	}
+	var menus []Menu
+	var err error
+	if tx, ok := c.Locals("tx").(pgx.Tx); ok && tx != nil {
+		menus, err = h.service.ListMenusForUser(c.Context(), tx, sess.UserID, sess.IsSuperAdmin)
+	} else {
+		menus, err = h.service.ListMenusForUser(c.Context(), nil, sess.UserID, sess.IsSuperAdmin)
+	}
 	if err != nil {
 		return response.InternalError(c, "Failed to list menus: "+err.Error())
 	}

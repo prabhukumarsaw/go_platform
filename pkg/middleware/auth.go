@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"newsplatform/api/pkg/config"
 	"newsplatform/api/pkg/response"
 )
@@ -42,7 +43,8 @@ type JWTClaims struct {
 
 // RequireAuth is a Fiber middleware that validates the JWT access token from the
 // Authorization header, extracts claims, and attaches a Session to the context.
-func RequireAuth(cfg config.JWTConfig) fiber.Handler {
+// It also verifies that the user account is still active in the database.
+func RequireAuth(cfg config.JWTConfig, pool ...*pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
 		if authHeader == "" {
@@ -70,6 +72,18 @@ func RequireAuth(cfg config.JWTConfig) fiber.Handler {
 		claims, ok := token.Claims.(*JWTClaims)
 		if !ok || !token.Valid {
 			return response.Unauthorized(c, "Invalid token claims")
+		}
+
+		// SECURITY: Check if user is still active in the database.
+		// This ensures deactivated users are rejected even with a valid JWT.
+		if len(pool) > 0 && pool[0] != nil {
+			var isActive bool
+			err := pool[0].QueryRow(c.Context(),
+				"SELECT is_active FROM users WHERE id = $1", claims.UserID,
+			).Scan(&isActive)
+			if err != nil || !isActive {
+				return response.Unauthorized(c, "Account is disabled or not found")
+			}
 		}
 
 		sess := &Session{

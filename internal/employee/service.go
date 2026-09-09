@@ -39,9 +39,6 @@ func (s *Service) OnboardEmployee(ctx context.Context, tx pgx.Tx, input OnboardE
 	if input.DisplayName == "" && input.UserID <= 0 {
 		return nil, errors.BadRequest("Full legal name is required", nil)
 	}
-	if input.EmployeeCode == "" {
-		return nil, errors.BadRequest("Employee code is required", nil)
-	}
 	if input.Designation == "" {
 		return nil, errors.BadRequest("Designation is required", nil)
 	}
@@ -56,6 +53,18 @@ func (s *Service) OnboardEmployee(ctx context.Context, tx pgx.Tx, input OnboardE
 
 func (s *Service) UpdateStatus(ctx context.Context, tx pgx.Tx, employeeID int64, isActive bool) error {
 	return s.repo.UpdateStatus(ctx, tx, employeeID, isActive)
+}
+
+func (s *Service) UpdateEmployee(ctx context.Context, tx pgx.Tx, employeeID int64, input UpdateEmployeeInput) (*Employee, error) {
+	return s.repo.UpdateEmployee(ctx, tx, employeeID, input)
+}
+
+func (s *Service) AssignRole(ctx context.Context, tx pgx.Tx, employeeID int64, roleID int) error {
+	return s.repo.AssignRole(ctx, tx, employeeID, roleID)
+}
+
+func (s *Service) NextEmployeeCode(ctx context.Context, tx pgx.Tx) (string, error) {
+	return s.repo.NextEmployeeCode(ctx, tx)
 }
 
 func (s *Service) DeleteEmployee(ctx context.Context, tx pgx.Tx, employeeID int64) error {

@@ -80,7 +80,7 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 	api := app.Group("/api/v1")
 
 	// ─── 1. Public Authentication Routes ────────────
-	h.Auth.RegisterRoutes(api, cfg.JWT)
+	h.Auth.RegisterRoutes(api, cfg.JWT, pool)
 
 	// ─── 2. Public Reader & Audience Routes ─────────
 	// Edge Caching: s-maxage=60s on Cloudflare/CDN edge, stale-while-revalidate=300s
@@ -108,21 +108,15 @@ func Setup(app *fiber.App, h *HandlerRegistry, pool *pgxpool.Pool, cfg *config.C
 		})
 	})
 
-	// Public Menus route for dynamic navigation
-	api.Get("/menus", h.IAM.ListMenus)
-	api.Get("/iam/menus", h.IAM.ListMenus)
-
 	// Public Settings (Platform identity, social channels, maintenance status)
 	if h.Settings != nil {
 		h.Settings.RegisterPublicRoutes(api)
 	}
 
 	// ─── 3. Staff Studio Routes (Newsroom CMS) ──────
-	authRequired := api.Group("", middleware.RequireAuth(cfg.JWT))
-	staffRoutes := authRequired.Group("", middleware.RequireStaff(), middleware.TransactionContext(pool))
+	authRequired := api.Group("", middleware.RequireAuth(cfg.JWT, pool))
+	staffRoutes := authRequired.Group("", middleware.RequireStaff(), middleware.TransactionContext(pool), h.IAM.StaffRBAC())
 
-	staffRoutes.Get("/menus", h.IAM.ListMenus)
-	staffRoutes.Get("/iam/menus", h.IAM.ListMenus)
 	h.IAM.RegisterRoutes(staffRoutes)
 
 	h.Content.RegisterStudioRoutes(staffRoutes)

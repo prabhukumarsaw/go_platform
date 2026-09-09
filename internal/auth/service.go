@@ -477,6 +477,9 @@ func (s *Service) GetUserByID(ctx context.Context, userID int64) (*User, error) 
 	if err != nil {
 		return nil, err
 	}
+	if !u.IsActive {
+		return nil, fmt.Errorf("account is disabled")
+	}
 	return &u, nil
 }
 
