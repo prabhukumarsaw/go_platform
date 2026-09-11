@@ -13,6 +13,44 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// DynamicPermissionAssignment represents a temporary permission assignment
+type DynamicPermissionAssignment struct {
+	ID           int
+	RoleID       int
+	PermissionID int
+	AssignedBy   int64
+	AssignedAt   time.Time
+	ExpiresAt    *time.Time
+	IsActive     bool
+	Reason       string
+}
+
+// ApprovalRequest represents a content approval workflow request
+type ApprovalRequest struct {
+	ID              int
+	ResourceType    string
+	ResourceID      int64
+	RequestedBy     int64
+	RequestedAt     time.Time
+	Status          string
+	ApprovedBy      *int64
+	ApprovedAt      *time.Time
+	RejectionReason *string
+	Comments        string
+}
+
+// ApprovalAssignment represents approval rights assignment
+type ApprovalAssignment struct {
+	ID           int
+	UserID       int64
+	ResourceType string
+	CanApprove   bool
+	AssignedBy   int64
+	AssignedAt   time.Time
+	ExpiresAt    *time.Time
+	IsActive     bool
+}
+
 type menuCache struct {
 	menus     []Menu
 	expiresAt time.Time
@@ -53,6 +91,27 @@ func (s *Service) Can(ctx context.Context, userID int64, action string) (bool, e
 		UserID: userID,
 		Action: action,
 	})
+}
+
+// normalizeAction converts enhanced action format to standard format for permission checking
+// e.g., "read_all" -> "read" with scope "all", "read_own" -> "read" with scope "own"
+func normalizeAction(action string) (string, string) {
+	// Handle enhanced action format
+	if strings.HasSuffix(action, "_all") {
+		return strings.TrimSuffix(action, "_all"), "all"
+	}
+	if strings.HasSuffix(action, "_own") {
+		return strings.TrimSuffix(action, "_own"), "own"
+	}
+	if strings.HasSuffix(action, "_department") {
+		return strings.TrimSuffix(action, "_department"), "department"
+	}
+	if strings.HasSuffix(action, "_custom") {
+		return strings.TrimSuffix(action, "_custom"), "custom"
+	}
+	
+	// Return as-is for standard format
+	return action, ""
 }
 
 // Evaluate adapts a middleware.PermissionEval-style check (used by RBAC guards).
@@ -110,6 +169,15 @@ func (s *Service) evaluate(ctx context.Context, tx pgx.Tx, req CanRequest, evalC
 			s.audit(ctx, tx, req, "OVERRIDE_GRANT", "super_admin bypass")
 		}
 		return true, nil
+	}
+
+	// Normalize enhanced action format (e.g., "read_all" -> "read" with scope "all")
+	normalizedAction, scope := normalizeAction(req.Action)
+	if scope != "" {
+		// Use the normalized action and add scope to context for enhanced permissions
+		req.Action = normalizedAction
+		// Store scope in eval context for later use in permission checks
+		evalCtx.Scope = scope
 	}
 
 	// Step 2-3: user permission overrides
@@ -324,6 +392,72 @@ func (s *Service) CreateABACPolicy(ctx context.Context, tx pgx.Tx, userID, _ int
 
 func (s *Service) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset int) ([]AuditEntry, int64, error) {
 	return s.repo.ListAuditLogs(ctx, tx, limit, offset)
+}
+
+// ─── Enhanced RBAC/ABAC Methods ───────────────────────────
+
+func (s *Service) ListAllPermissions(ctx context.Context, tx pgx.Tx) ([]Permission, error) {
+	return s.repo.ListAllPermissions(ctx, tx)
+}
+
+func (s *Service) GetRolePermissions(ctx context.Context, tx pgx.Tx, roleID int) ([]Permission, error) {
+	return s.repo.GetRolePermissions(ctx, tx, roleID)
+}
+
+func (s *Service) AssignRolePermissionsBulk(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, assignedBy int64) error {
+	return s.repo.AssignRolePermissions(ctx, tx, roleID, permissionIDs)
+}
+
+func (s *Service) RevokeRolePermissionsBulk(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, revokedBy int64) error {
+	return s.repo.RevokeRolePermissionsBulk(ctx, tx, roleID, permissionIDs, revokedBy)
+}
+
+func (s *Service) AssignDynamicPermissions(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, assignedBy int64, expiresAt *time.Time, reason string) error {
+	return s.repo.AssignDynamicPermissions(ctx, tx, roleID, permissionIDs, assignedBy, expiresAt, reason)
+}
+
+func (s *Service) GetDynamicPermissions(ctx context.Context, tx pgx.Tx, roleID int) ([]DynamicPermissionAssignment, error) {
+	return s.repo.GetDynamicPermissions(ctx, tx, roleID)
+}
+
+func (s *Service) RevokeDynamicPermission(ctx context.Context, tx pgx.Tx, assignmentID int, revokedBy int64) error {
+	return s.repo.RevokeDynamicPermission(ctx, tx, assignmentID, revokedBy)
+}
+
+// ─── Approval Workflow Methods ───────────────────────────
+
+func (s *Service) CreateApprovalRequest(ctx context.Context, tx pgx.Tx, resourceType string, resourceID int64, requestedBy int64, comments string) (int, error) {
+	return s.repo.CreateApprovalRequest(ctx, tx, resourceType, resourceID, requestedBy, comments)
+}
+
+func (s *Service) ListApprovalRequests(ctx context.Context, tx pgx.Tx, userID int64) ([]ApprovalRequest, error) {
+	return s.repo.ListApprovalRequests(ctx, tx, userID)
+}
+
+func (s *Service) GetPendingApprovals(ctx context.Context, tx pgx.Tx, userID int64) ([]ApprovalRequest, error) {
+	return s.repo.GetPendingApprovals(ctx, tx, userID)
+}
+
+func (s *Service) ApproveRequest(ctx context.Context, tx pgx.Tx, requestID int, approvedBy int64, comments string) error {
+	return s.repo.ApproveRequest(ctx, tx, requestID, approvedBy, comments)
+}
+
+func (s *Service) RejectRequest(ctx context.Context, tx pgx.Tx, requestID int, rejectedBy int64, reason string) error {
+	return s.repo.RejectRequest(ctx, tx, requestID, rejectedBy, reason)
+}
+
+// ─── Approval Assignment Methods ───────────────────────────
+
+func (s *Service) AssignApprovalRights(ctx context.Context, tx pgx.Tx, userID int64, resourceType string, canApprove bool, assignedBy int64, expiresAt *time.Time) error {
+	return s.repo.AssignApprovalRights(ctx, tx, userID, resourceType, canApprove, assignedBy, expiresAt)
+}
+
+func (s *Service) GetApprovalAssignments(ctx context.Context, tx pgx.Tx) ([]ApprovalAssignment, error) {
+	return s.repo.GetApprovalAssignments(ctx, tx)
+}
+
+func (s *Service) RevokeApprovalRights(ctx context.Context, tx pgx.Tx, assignmentID int, revokedBy int64) error {
+	return s.repo.RevokeApprovalRights(ctx, tx, assignmentID, revokedBy)
 }
 
 // ─── Staff Governance ───────────────────────────

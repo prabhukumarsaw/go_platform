@@ -15,12 +15,16 @@ import (
 
 // Handler exposes HTTP endpoints for IAM administration and permission evaluation.
 type Handler struct {
-	service *Service
+	service       *Service
+	enhancedService *EnhancedService
 }
 
 // NewHandler creates a new IAM handler.
-func NewHandler(service *Service) *Handler {
-	return &Handler{service: service}
+func NewHandler(service *Service, enhancedService *EnhancedService) *Handler {
+	return &Handler{
+		service:       service,
+		enhancedService: enhancedService,
+	}
 }
 
 // RegisterRoutes registers IAM admin and governance routes.
@@ -28,7 +32,7 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 	for _, path := range []string{"", "/iam"} {
 		iam := router.Group(path)
 
-		// 1. Roles & Permission Matrix
+		// 1. Roles & Permission Matrix (Legacy)
 		iam.Get("/roles", h.ListRoles)
 		iam.Post("/roles", h.CreateRole)
 		iam.Get("/roles/:id", h.GetRole)
@@ -39,31 +43,57 @@ func (h *Handler) RegisterRoutes(router fiber.Router) {
 		iam.Get("/roles/:id/matrix", h.GetRolePermissionMatrix)
 		iam.Put("/roles/:id/permissions", h.AssignRolePermissions)
 
-		// 2. Menus & Actions
+		// 2. Menus & Actions (Legacy)
 		iam.Get("/menus", h.ListMenus)
 		iam.Get("/menus/:menuId/actions", h.ListMenuActions)
 
 		// 3. Staff Governance & Scoping
 		iam.Get("/staff", h.ListStaffWithRoles)
 
-		// 3. User Role & Scoping
+		// 4. User Role & Scoping
 		iam.Post("/users/:userId/roles", h.AssignUserRole)
 		iam.Get("/users/:userId/categories", h.GetUserCategoryScopes)
 		iam.Post("/users/:userId/categories", h.AssignUserCategoryScopes)
 		iam.Get("/users/:userId/districts", h.GetUserCategoryScopes)
 		iam.Post("/users/:userId/districts", h.AssignUserCategoryScopes)
 
-		// 4. Effective Permissions
+		// 5. Effective Permissions (Legacy)
 		iam.Get("/users/:userId/permissions", h.GetUserEffectivePermissions)
 		iam.Get("/me/permissions", h.GetMyEffectivePermissions)
 		iam.Get("/me/menus", h.ListMyMenus)
 
-		// 5. Overrides & ABAC Policies
+		// 6. Overrides & ABAC Policies (Legacy)
 		iam.Post("/overrides", h.CreateOverride)
 		iam.Post("/abac-policies", h.CreateABACPolicy)
 
-		// 6. Security & Permission Audit Log
+		// 7. Security & Permission Audit Log
 		iam.Get("/audit-log", h.ListAuditLogs)
+
+		// 8. Enhanced RBAC/ABAC APIs
+		iam.Get("/permissions", h.ListAllPermissions)
+		iam.Get("/roles/:id/permissions-new", h.GetRolePermissionsNew)
+		iam.Post("/roles/:id/permissions", h.AssignRolePermissionsNew)
+		iam.Post("/roles/:id/dynamic-permissions", h.AssignDynamicPermissions)
+		iam.Get("/roles/:id/dynamic-permissions", h.GetDynamicPermissions)
+		iam.Delete("/dynamic-permissions/:assignmentId", h.RevokeDynamicPermission)
+		
+		// 9. Approval Workflow APIs
+		iam.Post("/approval-requests", h.CreateApprovalRequest)
+		iam.Get("/approval-requests", h.ListApprovalRequests)
+		iam.Post("/approval-requests/:id/approve", h.ApproveRequest)
+		iam.Post("/approval-requests/:id/reject", h.RejectRequest)
+		iam.Get("/approval-requests/pending", h.GetPendingApprovals)
+		
+		// 10. Approval Assignment APIs (SuperAdmin)
+		iam.Post("/approval-assignments", h.AssignApprovalRights)
+		iam.Get("/approval-assignments", h.GetApprovalAssignments)
+		iam.Delete("/approval-assignments/:id", h.RevokeApprovalRights)
+	}
+
+	// Register enhanced routes if enhanced service is available
+	if h.enhancedService != nil {
+		enhancedHandler := NewEnhancedHandler(h.enhancedService)
+		enhancedHandler.RegisterEnhancedRoutes(router)
 	}
 }
 
@@ -436,6 +466,259 @@ func (h *Handler) ListAuditLogs(c *fiber.Ctx) error {
 	}
 
 	return response.Paginated(c, logs, (offset/limit)+1, limit, total)
+}
+
+// ─── Enhanced RBAC/ABAC Handlers ───────────────────────────
+
+func (h *Handler) ListAllPermissions(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	
+	permissions, err := h.service.ListAllPermissions(c.Context(), tx)
+	if err != nil {
+		return response.InternalError(c, "Failed to list permissions: "+err.Error())
+	}
+	
+	return response.Success(c, permissions)
+}
+
+func (h *Handler) GetRolePermissionsNew(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid role ID")
+	}
+
+	permissions, err := h.service.GetRolePermissions(c.Context(), tx, id)
+	if err != nil {
+		return response.InternalError(c, "Failed to get role permissions: "+err.Error())
+	}
+	
+	return response.Success(c, permissions)
+}
+
+func (h *Handler) AssignRolePermissionsNew(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid role ID")
+	}
+
+	var req struct {
+		Grant []int  `json:"grant"`
+		Revoke []int `json:"revoke"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if len(req.Grant) > 0 {
+		if err := h.service.AssignRolePermissionsBulk(c.Context(), tx, id, req.Grant, sess.UserID); err != nil {
+			return response.InternalError(c, "Failed to grant permissions: "+err.Error())
+		}
+	}
+
+	if len(req.Revoke) > 0 {
+		if err := h.service.RevokeRolePermissionsBulk(c.Context(), tx, id, req.Revoke, sess.UserID); err != nil {
+			return response.InternalError(c, "Failed to revoke permissions: "+err.Error())
+		}
+	}
+
+	return response.Success(c, fiber.Map{"message": "Permissions updated successfully"})
+}
+
+func (h *Handler) AssignDynamicPermissions(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid role ID")
+	}
+
+	var req struct {
+		PermissionIDs []int    `json:"permission_ids"`
+		ExpiresAt     *time.Time `json:"expires_at"`
+		Reason        string    `json:"reason"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.AssignDynamicPermissions(c.Context(), tx, id, req.PermissionIDs, sess.UserID, req.ExpiresAt, req.Reason); err != nil {
+		return response.InternalError(c, "Failed to assign dynamic permissions: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Dynamic permissions assigned successfully"})
+}
+
+func (h *Handler) GetDynamicPermissions(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid role ID")
+	}
+
+	permissions, err := h.service.GetDynamicPermissions(c.Context(), tx, id)
+	if err != nil {
+		return response.InternalError(c, "Failed to get dynamic permissions: "+err.Error())
+	}
+
+	return response.Success(c, permissions)
+}
+
+func (h *Handler) RevokeDynamicPermission(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	assignmentId, err := strconv.Atoi(c.Params("assignmentId"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid assignment ID")
+	}
+
+	if err := h.service.RevokeDynamicPermission(c.Context(), tx, assignmentId, sess.UserID); err != nil {
+		return response.InternalError(c, "Failed to revoke dynamic permission: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Dynamic permission revoked successfully"})
+}
+
+// ─── Approval Workflow Handlers ───────────────────────────
+
+func (h *Handler) CreateApprovalRequest(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+
+	var req struct {
+		ResourceType string `json:"resource_type"`
+		ResourceID   int64  `json:"resource_id"`
+		Comments     string `json:"comments"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	requestID, err := h.service.CreateApprovalRequest(c.Context(), tx, req.ResourceType, req.ResourceID, sess.UserID, req.Comments)
+	if err != nil {
+		return response.InternalError(c, "Failed to create approval request: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"request_id": requestID, "status": "pending"})
+}
+
+func (h *Handler) ListApprovalRequests(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+
+	requests, err := h.service.ListApprovalRequests(c.Context(), tx, sess.UserID)
+	if err != nil {
+		return response.InternalError(c, "Failed to list approval requests: "+err.Error())
+	}
+
+	return response.Success(c, requests)
+}
+
+func (h *Handler) GetPendingApprovals(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+
+	requests, err := h.service.GetPendingApprovals(c.Context(), tx, sess.UserID)
+	if err != nil {
+		return response.InternalError(c, "Failed to get pending approvals: "+err.Error())
+	}
+
+	return response.Success(c, requests)
+}
+
+func (h *Handler) ApproveRequest(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid request ID")
+	}
+
+	var req struct {
+		Comments string `json:"comments"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.ApproveRequest(c.Context(), tx, id, sess.UserID, req.Comments); err != nil {
+		return response.InternalError(c, "Failed to approve request: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Request approved successfully"})
+}
+
+func (h *Handler) RejectRequest(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid request ID")
+	}
+
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.RejectRequest(c.Context(), tx, id, sess.UserID, req.Reason); err != nil {
+		return response.InternalError(c, "Failed to reject request: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Request rejected successfully"})
+}
+
+// ─── Approval Assignment Handlers (SuperAdmin) ───────────────────────────
+
+func (h *Handler) AssignApprovalRights(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+
+	var req struct {
+		UserID       int64       `json:"user_id"`
+		ResourceType string      `json:"resource_type"`
+		CanApprove   bool        `json:"can_approve"`
+		ExpiresAt    *time.Time  `json:"expires_at"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.AssignApprovalRights(c.Context(), tx, req.UserID, req.ResourceType, req.CanApprove, sess.UserID, req.ExpiresAt); err != nil {
+		return response.InternalError(c, "Failed to assign approval rights: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Approval rights assigned successfully"})
+}
+
+func (h *Handler) GetApprovalAssignments(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+
+	assignments, err := h.service.GetApprovalAssignments(c.Context(), tx)
+	if err != nil {
+		return response.InternalError(c, "Failed to get approval assignments: "+err.Error())
+	}
+
+	return response.Success(c, assignments)
+}
+
+func (h *Handler) RevokeApprovalRights(c *fiber.Ctx) error {
+	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
+	id, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return response.BadRequest(c, "Invalid assignment ID")
+	}
+
+	if err := h.service.RevokeApprovalRights(c.Context(), tx, id, sess.UserID); err != nil {
+		return response.InternalError(c, "Failed to revoke approval rights: "+err.Error())
+	}
+
+	return response.Success(c, fiber.Map{"message": "Approval rights revoked successfully"})
 }
 
 func (h *Handler) ApplyRoleTemplate(c *fiber.Ctx) error {

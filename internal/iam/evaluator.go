@@ -15,6 +15,7 @@ type EvalContext struct {
 	RequestID string
 	Now       time.Time
 	DeviceType string // "mobile", "desktop", "tablet"
+	Scope     string // "all", "own", "department", "custom" for enhanced permissions
 }
 
 // evaluateABAC checks all active ABAC policies for a user.

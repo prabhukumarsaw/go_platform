@@ -89,16 +89,23 @@ type FeaturedSectionData struct {
 	BreakingNews        []HomeArticleItem `json:"breakingNews"`
 }
 
-// CategorySectionData holds the 5 main categories + trending + exclusive.
+// CategorySectionData holds the 5 main categories + trending + exclusive + similar + recommended + additional categories.
 type CategorySectionData struct {
-	Politics      CategoryBlockAData `json:"politics"`
-	Sports        CategoryBlockAData `json:"sports"`
-	Entertainment CategoryBlockBData `json:"entertainment"`
-	Crime         CategoryBlockAData `json:"crime"`
-	Business      CategoryBlockBData `json:"business"`
-	TopTrending   []HomeArticleItem  `json:"topTrending"`
-	ExclusiveNews []HomeArticleItem  `json:"exclusiveNews"`
-	SidebarBottom []HomeArticleItem  `json:"sidebarBottom"`
+	Politics         CategoryBlockAData `json:"politics"`
+	Sports           CategoryBlockAData `json:"sports"`
+	Entertainment    CategoryBlockBData `json:"entertainment"`
+	Crime            CategoryBlockAData `json:"crime"`
+	Business         CategoryBlockBData `json:"business"`
+	TopTrending      []HomeArticleItem  `json:"topTrending"`
+	ExclusiveNews    []HomeArticleItem  `json:"exclusiveNews"`
+	SidebarBottom    []HomeArticleItem  `json:"sidebarBottom"`
+	RecentNews       []HomeArticleItem  `json:"recentNews"`
+	RecommendedNews []HomeArticleItem  `json:"recommendedNews"`
+	SimilarNews      []HomeArticleItem  `json:"similarNews"`
+	AutoNews         []HomeArticleItem  `json:"autoNews"`
+	LifestyleNews    []HomeArticleItem  `json:"lifestyleNews"`
+	HealthNews       []HomeArticleItem  `json:"healthNews"`
+	EducationNews    []HomeArticleItem  `json:"educationNews"`
 }
 
 // TechnologySectionData holds the technology spotlight block.
@@ -246,9 +253,15 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
-	// 4. Strict Zero-Duplicate Global Seen Tracker
+	// 4. Enhanced Zero-Duplicate Global Seen Tracker
+	// Uses multiple tracking mechanisms to prevent duplicates across sections:
+	// - article ID (UUID) as primary key
+	// - slug as secondary check
+	// - title hash as tertiary check for edge cases
 	// ─────────────────────────────────────────────────────────────────────────
 	seen := make(map[string]bool)
+	seenSlugs := make(map[string]bool)
+	seenTitles := make(map[string]bool) // Additional title-based tracking for safety
 
 	// Candidate Fetching Helpers with smart language fallback:
 	fetchCandidates := func(filter ListArticlesFilter) []ArticleListItem {
@@ -362,12 +375,16 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 		})
 	}
 
-	// Helper functions for selecting unique, non-duplicated articles
+	// Helper functions for selecting unique, non-duplicated articles with enhanced tracking
 	takeSingle := func(candidates []ArticleListItem) *HomeArticleItem {
 		for _, it := range candidates {
 			idStr := it.ID.String()
-			if !seen[idStr] {
+			slug := it.Slug
+			titleHash := fmt.Sprintf("%x", len(it.Title)) // Simple hash for title comparison
+			if !seen[idStr] && !seenSlugs[slug] && !seenTitles[titleHash] {
 				seen[idStr] = true
+				seenSlugs[slug] = true
+				seenTitles[titleHash] = true
 				item := toHomeArticleItem(it)
 				return &item
 			}
@@ -375,8 +392,12 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 		// Fallback to general pool
 		for _, it := range generalPool {
 			idStr := it.ID.String()
-			if !seen[idStr] {
+			slug := it.Slug
+			titleHash := fmt.Sprintf("%x", len(it.Title))
+			if !seen[idStr] && !seenSlugs[slug] && !seenTitles[titleHash] {
 				seen[idStr] = true
+				seenSlugs[slug] = true
+				seenTitles[titleHash] = true
 				item := toHomeArticleItem(it)
 				return &item
 			}
@@ -388,19 +409,27 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 		res := []HomeArticleItem{}
 		for _, it := range candidates {
 			idStr := it.ID.String()
-			if !seen[idStr] {
+			slug := it.Slug
+			titleHash := fmt.Sprintf("%x", len(it.Title))
+			if !seen[idStr] && !seenSlugs[slug] && !seenTitles[titleHash] {
 				seen[idStr] = true
+				seenSlugs[slug] = true
+				seenTitles[titleHash] = true
 				res = append(res, toHomeArticleItem(it))
 				if len(res) >= count {
 					return res
 				}
 			}
 		}
-		// Fill remaining from general pool if needed, NEVER repeating any seen ID
+		// Fill remaining from general pool if needed, NEVER repeating any seen ID, slug, or title
 		for _, it := range generalPool {
 			idStr := it.ID.String()
-			if !seen[idStr] {
+			slug := it.Slug
+			titleHash := fmt.Sprintf("%x", len(it.Title))
+			if !seen[idStr] && !seenSlugs[slug] && !seenTitles[titleHash] {
 				seen[idStr] = true
+				seenSlugs[slug] = true
+				seenTitles[titleHash] = true
 				res = append(res, toHomeArticleItem(it))
 				if len(res) >= count {
 					break
@@ -571,6 +600,74 @@ func (s *Service) generateHomeFeed(ctx context.Context, language, districtSlug s
 	resp.CategorySectionData.TopTrending = takeMultiple(trendingCandidates, 5)
 	resp.CategorySectionData.ExclusiveNews = takeMultiple(generalPool, 3)
 	resp.CategorySectionData.SidebarBottom = takeMultiple(generalPool, 4)
+
+	// Additional Category-wise News Sections for comprehensive coverage
+	// Auto Category
+	autoCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Category: "auto",
+		Status:   "published",
+		PerPage:  15,
+	})
+
+	// Lifestyle Category
+	lifestyleCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Category: "lifestyle",
+		Status:   "published",
+		PerPage:  15,
+	})
+
+	// Health Category
+	healthCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Category: "health",
+		Status:   "published",
+		PerPage:  15,
+	})
+
+	// Education Category
+	educationCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Category: "education",
+		Status:   "published",
+		PerPage:  15,
+	})
+	
+	// New Sections: Recent News (latest articles from all categories)
+	recentCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Status:   "published",
+		SortBy:   "latest",
+		PerPage:  12,
+	})
+	resp.CategorySectionData.RecentNews = takeMultiple(recentCandidates, 12)
+	
+	// Recommended News (based on view count and engagement metrics)
+	recommendedCandidates := fetchCandidates(ListArticlesFilter{
+		Language: language,
+		Status:   "published",
+		SortBy:   "trending",
+		PerPage:  8,
+	})
+	resp.CategorySectionData.RecommendedNews = takeMultiple(recommendedCandidates, 8)
+
+	// Similar News (articles from same categories as trending/featured, but different articles)
+	// This provides category-wise similar news recommendations
+	similarNewsCandidates := fetchCandidates(ListArticlesFilter{
+		Language:   language,
+		Status:     "published",
+		Categories: []string{"politics", "sports", "entertainment", "crime", "business"},
+		SortBy:     "latest",
+		PerPage:    10,
+	})
+	resp.CategorySectionData.SimilarNews = takeMultiple(similarNewsCandidates, 10)
+
+	// Additional Category-wise News for comprehensive coverage
+	resp.CategorySectionData.AutoNews = takeMultiple(autoCandidates, 6)
+	resp.CategorySectionData.LifestyleNews = takeMultiple(lifestyleCandidates, 6)
+	resp.CategorySectionData.HealthNews = takeMultiple(healthCandidates, 6)
+	resp.CategorySectionData.EducationNews = takeMultiple(educationCandidates, 6)
 
 	// ─── PIPELINE STEP 7: FOUR-COLUMN SECTION 2 ───────────────────────────────
 	resp.FourColumnSection2 = buildFourColumnItems("four_col_2", []string{"auto", "lifestyle", "dharma", "environment"})

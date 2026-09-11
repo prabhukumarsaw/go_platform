@@ -3,6 +3,7 @@ package analytics
 import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
+	"newsplatform/api/pkg/middleware"
 	"newsplatform/api/pkg/response"
 )
 
@@ -22,8 +23,24 @@ func (h *Handler) RegisterAdminRoutes(router fiber.Router) {
 
 func (h *Handler) GetOverview(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
 
-	overview, err := h.service.GetOverview(c.Context(), tx)
+	// Apply ownership-based filtering for reporters
+	var authorID *int64
+	if sess != nil && !sess.IsSuperAdmin {
+		hasRestrictedRole := false
+		for _, role := range sess.Roles {
+			if role == "reporter" || role == "correspondent" {
+				hasRestrictedRole = true
+				break
+			}
+		}
+		if hasRestrictedRole {
+			authorID = &sess.UserID
+		}
+	}
+
+	overview, err := h.service.GetOverview(c.Context(), tx, authorID)
 	if err != nil {
 		return response.InternalError(c, "Failed to get analytics overview: "+err.Error())
 	}

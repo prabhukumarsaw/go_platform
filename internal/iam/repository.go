@@ -642,6 +642,33 @@ func (r *Repository) AssignUserCategoryScopes(ctx context.Context, tx pgx.Tx, us
 	return nil
 }
 
+// ─── Resource Ownership Operations ──────────────────────
+
+func (r *Repository) GetResourceOwner(ctx context.Context, tx pgx.Tx, resourceType, resourceID string) (int64, error) {
+	var ownerID int64
+	var query string
+	
+	switch resourceType {
+	case "articles":
+		query = "SELECT owner_id FROM articles WHERE id::text = $1"
+	case "media":
+		query = "SELECT owner_id FROM media WHERE id::text = $1"
+	case "live_blog_entries":
+		query = "SELECT owner_id FROM live_blog_entries WHERE id::text = $1"
+	case "web_stories":
+		query = "SELECT owner_id FROM web_stories WHERE id::text = $1"
+	default:
+		return 0, fmt.Errorf("unsupported resource type: %s", resourceType)
+	}
+	
+	err := tx.QueryRow(ctx, query, resourceID).Scan(&ownerID)
+	if err != nil {
+		return 0, err
+	}
+	
+	return ownerID, nil
+}
+
 // Backward-compatibility aliases for legacy frontend routes
 func (r *Repository) GetUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID int64) ([]int, error) {
 	scopes, err := r.GetUserCategoryScopes(ctx, tx, userID)
@@ -653,6 +680,1014 @@ func (r *Repository) GetUserDistrictScopes(ctx context.Context, tx pgx.Tx, userI
 		ids = append(ids, s.CategoryID)
 	}
 	return ids, nil
+}
+
+func (r *Repository) CheckResourceOwnership(ctx context.Context, tx pgx.Tx, userID int64, resourceType, resourceID string) (bool, error) {
+	ownerID, err := r.GetResourceOwner(ctx, tx, resourceType, resourceID)
+	if err != nil {
+		return false, err
+	}
+	
+	return ownerID == userID, nil
+}
+
+// ─── NEW: Permission Operations (Resource-Action-Scope Model) ──────────────────────
+
+// Permission represents a resource-action-scope permission
+type Permission struct {
+	ID          int        `json:"id"`
+	Resource    string     `json:"resource"`
+	Action      string     `json:"action"`
+	Scope       string     `json:"scope"`
+	Description string     `json:"description"`
+	IsSystem    bool       `json:"is_system"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+// PermissionGroup represents a collection of permissions
+type PermissionGroup struct {
+	ID          int        `json:"id"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	IsSystem    bool       `json:"is_system"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+// UserPermission represents a direct user permission grant
+type UserPermission struct {
+	UserID       int64       `json:"user_id"`
+	PermissionID int         `json:"permission_id"`
+	Permission   Permission  `json:"permission"`
+	Effect       string      `json:"effect"`
+	Reason       string      `json:"reason"`
+	GrantedBy    int64       `json:"granted_by"`
+	ValidFrom    time.Time   `json:"valid_from"`
+	ValidUntil   *time.Time  `json:"valid_until,omitempty"`
+	Conditions   interface{} `json:"conditions,omitempty"`
+}
+
+// ResourceGrant represents a specific resource access grant
+type ResourceGrant struct {
+	ID           int64       `json:"id"`
+	UserID       int64       `json:"user_id"`
+	ResourceType string      `json:"resource_type"`
+	ResourceID   string      `json:"resource_id"`
+	Permission   Permission  `json:"permission"`
+	GrantedBy    int64       `json:"granted_by"`
+	GrantedAt    time.Time   `json:"granted_at"`
+	ExpiresAt    *time.Time  `json:"expires_at,omitempty"`
+	Conditions   interface{} `json:"conditions,omitempty"`
+}
+
+// EnhancedABACPolicy represents an advanced ABAC policy
+type EnhancedABACPolicy struct {
+	ID          int64       `json:"id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	PolicyType  string      `json:"policy_type"`
+	TargetID    *int64      `json:"target_id,omitempty"`
+	Effect      string      `json:"effect"`
+	Priority    int         `json:"priority"`
+	Conditions  interface{} `json:"conditions"`
+	IsActive    bool        `json:"is_active"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
+}
+
+// ListPermissions returns all permissions
+func (r *Repository) ListPermissions(ctx context.Context, tx pgx.Tx) ([]Permission, error) {
+	query := `
+		SELECT id, resource, action, scope, COALESCE(description,''), is_system, created_at
+		FROM permissions
+		ORDER BY resource, action, scope
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var permissions []Permission
+	for rows.Next() {
+		var p Permission
+		if err := rows.Scan(&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		permissions = append(permissions, p)
+	}
+	return permissions, nil
+}
+
+// GetPermission returns a specific permission
+func (r *Repository) GetPermission(ctx context.Context, tx pgx.Tx, permissionID int) (*Permission, error) {
+	query := `
+		SELECT id, resource, action, scope, COALESCE(description,''), is_system, created_at
+		FROM permissions WHERE id = $1
+	`
+	var p Permission
+	err := tx.QueryRow(ctx, query, permissionID).Scan(
+		&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// CreatePermission creates a new permission
+func (r *Repository) CreatePermission(ctx context.Context, tx pgx.Tx, resource, action, scope, description string, isSystem bool) (*Permission, error) {
+	query := `
+		INSERT INTO permissions (resource, action, scope, description, is_system)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, resource, action, scope, description, is_system, created_at
+	`
+	var p Permission
+	err := tx.QueryRow(ctx, query, resource, action, scope, description, isSystem).Scan(
+		&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ListPermissionGroups returns all permission groups
+func (r *Repository) ListPermissionGroups(ctx context.Context, tx pgx.Tx) ([]PermissionGroup, error) {
+	query := `
+		SELECT id, name, COALESCE(description,''), is_system, created_at
+		FROM permission_groups
+		ORDER BY name
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []PermissionGroup
+	for rows.Next() {
+		var g PermissionGroup
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.IsSystem, &g.CreatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// GetRolePermissions returns permissions for a specific role
+func (r *Repository) GetRolePermissions(ctx context.Context, tx pgx.Tx, roleID int) ([]Permission, error) {
+	query := `
+		SELECT p.id, p.resource, p.action, p.scope, COALESCE(p.description,''), p.is_system, p.created_at
+		FROM role_permissions rp
+		JOIN permissions p ON p.id = rp.permission_id
+		WHERE rp.role_id = $1
+		  AND (rp.expires_at IS NULL OR rp.expires_at > NOW())
+		ORDER BY p.resource, p.action, p.scope
+	`
+	rows, err := tx.Query(ctx, query, roleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var permissions []Permission
+	for rows.Next() {
+		var p Permission
+		if err := rows.Scan(&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		permissions = append(permissions, p)
+	}
+	return permissions, nil
+}
+
+// HasEnhancedPermission checks if a role has a specific enhanced permission
+func (r *Repository) HasEnhancedPermission(ctx context.Context, tx pgx.Tx, roleID int, resource, action string) (bool, error) {
+	var count int
+	query := `
+		SELECT COUNT(*)
+		FROM role_permissions rp
+		JOIN permissions p ON p.id = rp.permission_id
+		WHERE rp.role_id = $1
+		  AND p.resource = $2
+		  AND p.action = $3
+		  AND (rp.expires_at IS NULL OR rp.expires_at > NOW())
+	`
+	err := tx.QueryRow(ctx, query, roleID, resource, action).Scan(&count)
+	return count > 0, err
+}
+
+// AssignRolePermissions assigns permissions to a role (new system)
+func (r *Repository) AssignRolePermissionsNew(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, grantedBy int64) error {
+	// Remove existing grants
+	_, err := tx.Exec(ctx, "DELETE FROM role_permissions WHERE role_id = $1", roleID)
+	if err != nil {
+		return err
+	}
+
+	// Insert new grants
+	for _, permID := range permissionIDs {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO role_permissions (role_id, permission_id, granted_by)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (role_id, permission_id) 
+			 DO UPDATE SET granted_by = EXCLUDED.granted_by`,
+			roleID, permID, grantedBy,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetUserPermissions returns direct permissions for a user
+func (r *Repository) GetUserPermissions(ctx context.Context, tx pgx.Tx, userID int64) ([]UserPermission, error) {
+	query := `
+		SELECT 
+			up.user_id, up.permission_id, up.effect, COALESCE(up.reason,''),
+			COALESCE(up.granted_by, 0), up.valid_from, up.valid_until, up.conditions,
+			p.id, p.resource, p.action, p.scope, COALESCE(p.description,''), p.is_system, p.created_at
+		FROM user_permissions up
+		JOIN permissions p ON p.id = up.permission_id
+		WHERE up.user_id = $1
+		  AND (up.valid_until IS NULL OR up.valid_until > NOW())
+		  AND (up.valid_from IS NULL OR up.valid_from <= NOW())
+		ORDER BY p.resource, p.action, p.scope
+	`
+	rows, err := tx.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var userPerms []UserPermission
+	for rows.Next() {
+		var up UserPermission
+		var p Permission
+		var conditions json.RawMessage
+		if err := rows.Scan(
+			&up.UserID, &up.PermissionID, &up.Effect, &up.Reason,
+			&up.GrantedBy, &up.ValidFrom, &up.ValidUntil, &conditions,
+			&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		up.Permission = p
+		if conditions != nil {
+			up.Conditions = conditions
+		}
+		userPerms = append(userPerms, up)
+	}
+	return userPerms, nil
+}
+
+// GrantUserPermission grants a direct permission to a user
+func (r *Repository) GrantUserPermission(ctx context.Context, tx pgx.Tx, userID int64, permissionID int, effect, reason string, validFrom, validUntil *time.Time, grantedBy int64) error {
+	query := `
+		INSERT INTO user_permissions (user_id, permission_id, effect, reason, valid_from, valid_until, granted_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (user_id, permission_id, effect)
+		DO UPDATE SET 
+			reason = EXCLUDED.reason,
+			valid_from = EXCLUDED.valid_from,
+			valid_until = EXCLUDED.valid_until,
+			granted_by = EXCLUDED.granted_by
+	`
+	_, err := tx.Exec(ctx, query, userID, permissionID, effect, reason, validFrom, validUntil, grantedBy)
+	return err
+}
+
+// RevokeUserPermission revokes a direct permission from a user
+func (r *Repository) RevokeUserPermission(ctx context.Context, tx pgx.Tx, userID int64, permissionID int) error {
+	_, err := tx.Exec(ctx, "DELETE FROM user_permissions WHERE user_id = $1 AND permission_id = $2", userID, permissionID)
+	return err
+}
+
+// GetUserResourceGrants returns resource-specific grants for a user
+func (r *Repository) GetUserResourceGrants(ctx context.Context, tx pgx.Tx, userID int64) ([]ResourceGrant, error) {
+	query := `
+		SELECT 
+			rg.id, rg.user_id, rg.resource_type, rg.resource_id,
+			COALESCE(rg.granted_by, 0), rg.granted_at, rg.expires_at, rg.conditions,
+			p.id, p.resource, p.action, p.scope, COALESCE(p.description,''), p.is_system, p.created_at
+		FROM resource_grants rg
+		JOIN permissions p ON p.id = rg.permission_id
+		WHERE rg.user_id = $1
+		  AND (rg.expires_at IS NULL OR rg.expires_at > NOW())
+		ORDER BY rg.resource_type, rg.resource_id
+	`
+	rows, err := tx.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var grants []ResourceGrant
+	for rows.Next() {
+		var rg ResourceGrant
+		var p Permission
+		var conditions json.RawMessage
+		if err := rows.Scan(
+			&rg.ID, &rg.UserID, &rg.ResourceType, &rg.ResourceID,
+			&rg.GrantedBy, &rg.GrantedAt, &rg.ExpiresAt, &conditions,
+			&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem, &p.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		rg.Permission = p
+		if conditions != nil {
+			rg.Conditions = conditions
+		}
+		grants = append(grants, rg)
+	}
+	return grants, nil
+}
+
+// CreateResourceGrant creates a resource-specific access grant
+func (r *Repository) CreateResourceGrant(ctx context.Context, tx pgx.Tx, userID int64, resourceType, resourceID string, permissionID int, grantedBy int64, expiresAt *time.Time, conditions json.RawMessage) (*ResourceGrant, error) {
+	query := `
+		INSERT INTO resource_grants (user_id, resource_type, resource_id, permission_id, granted_by, expires_at, conditions)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, user_id, resource_type, resource_id, granted_by, granted_at, expires_at, conditions
+	`
+	var rg ResourceGrant
+	err := tx.QueryRow(ctx, query, userID, resourceType, resourceID, permissionID, grantedBy, expiresAt, conditions).Scan(
+		&rg.ID, &rg.UserID, &rg.ResourceType, &rg.ResourceID,
+		&rg.GrantedBy, &rg.GrantedAt, &rg.ExpiresAt, &rg.Conditions,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch permission details
+	p, err := r.GetPermission(ctx, tx, permissionID)
+	if err != nil {
+		return nil, err
+	}
+	rg.Permission = *p
+
+	return &rg, nil
+}
+
+// RevokeResourceGrant revokes a resource-specific grant
+func (r *Repository) RevokeResourceGrant(ctx context.Context, tx pgx.Tx, grantID int64) error {
+	_, err := tx.Exec(ctx, "DELETE FROM resource_grants WHERE id = $1", grantID)
+	return err
+}
+
+// ListEnhancedABACPolicies returns all ABAC policies
+func (r *Repository) ListEnhancedABACPolicies(ctx context.Context, tx pgx.Tx) ([]EnhancedABACPolicy, error) {
+	query := `
+		SELECT id, name, COALESCE(description,''), policy_type, target_id, effect, priority, conditions, is_active, created_at, updated_at
+		FROM abac_policies
+		WHERE is_active = true
+		ORDER BY priority DESC, id
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var policies []EnhancedABACPolicy
+	for rows.Next() {
+		var p EnhancedABACPolicy
+		var conditions json.RawMessage
+		if err := rows.Scan(
+			&p.ID, &p.Name, &p.Description, &p.PolicyType, &p.TargetID,
+			&p.Effect, &p.Priority, &conditions, &p.IsActive, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if conditions != nil {
+			p.Conditions = conditions
+		}
+		policies = append(policies, p)
+	}
+	return policies, nil
+}
+
+// CreateEnhancedABACPolicy creates a new ABAC policy
+func (r *Repository) CreateEnhancedABACPolicy(ctx context.Context, tx pgx.Tx, name, description, policyType string, targetID *int64, effect string, priority int, conditions json.RawMessage) (*EnhancedABACPolicy, error) {
+	query := `
+		INSERT INTO abac_policies (name, description, policy_type, target_id, effect, priority, conditions)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, name, description, policy_type, target_id, effect, priority, conditions, is_active, created_at, updated_at
+	`
+	var p EnhancedABACPolicy
+	err := tx.QueryRow(ctx, query, name, description, policyType, targetID, effect, priority, conditions).Scan(
+		&p.ID, &p.Name, &p.Description, &p.PolicyType, &p.TargetID,
+		&p.Effect, &p.Priority, &p.Conditions, &p.IsActive, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpdateEnhancedABACPolicy updates an existing ABAC policy
+func (r *Repository) UpdateEnhancedABACPolicy(ctx context.Context, tx pgx.Tx, policyID int64, name, description string, effect string, priority int, conditions json.RawMessage) (*EnhancedABACPolicy, error) {
+	query := `
+		UPDATE abac_policies
+		SET name = $1, description = $2, effect = $3, priority = $4, conditions = $5, updated_at = NOW()
+		WHERE id = $6
+		RETURNING id, name, description, policy_type, target_id, effect, priority, conditions, is_active, created_at, updated_at
+	`
+	var p EnhancedABACPolicy
+	err := tx.QueryRow(ctx, query, name, description, effect, priority, conditions, policyID).Scan(
+		&p.ID, &p.Name, &p.Description, &p.PolicyType, &p.TargetID,
+		&p.Effect, &p.Priority, &p.Conditions, &p.IsActive, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// DeleteEnhancedABACPolicy deletes an ABAC policy
+func (r *Repository) DeleteEnhancedABACPolicy(ctx context.Context, tx pgx.Tx, policyID int64) error {
+	_, err := tx.Exec(ctx, "DELETE FROM abac_policies WHERE id = $1", policyID)
+	return err
+}
+
+// RefreshPermissionCache refreshes the materialized view
+func (r *Repository) RefreshPermissionCache(ctx context.Context) error {
+	// Try to refresh the materialized view concurrently
+	_, err := r.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY user_effective_permissions_cache")
+	if err != nil {
+		// If concurrent refresh fails, try regular refresh
+		_, err = r.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW user_effective_permissions_cache")
+		if err != nil {
+			// If materialized view doesn't exist, log but don't fail
+			// This allows the system to work without the cache
+			return nil
+		}
+	}
+	return nil
+}
+
+// GetUserEffectivePermissionsNew returns all effective permissions for a user (new system)
+func (r *Repository) GetUserEffectivePermissionsNew(ctx context.Context, tx pgx.Tx, userID int64) (*EffectivePermissions, error) {
+	// Get user roles
+	rolesQuery := `
+		SELECT r.name 
+		FROM user_roles ur
+		JOIN roles r ON r.id = ur.role_id
+		WHERE ur.user_id = $1 AND ur.is_active = true
+	`
+	rows, err := tx.Query(ctx, rolesQuery, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var roles []string
+	for rows.Next() {
+		var roleName string
+		if err := rows.Scan(&roleName); err != nil {
+			return nil, err
+		}
+		roles = append(roles, roleName)
+	}
+
+	// Get effective permissions from cache
+	permsQuery := `
+		SELECT DISTINCT resource, action, scope
+		FROM user_effective_permissions_cache
+		WHERE user_id = $1
+		ORDER BY resource, action, scope
+	`
+	permRows, err := tx.Query(ctx, permsQuery, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer permRows.Close()
+
+	var permissions []string
+	for permRows.Next() {
+		var resource, action, scope string
+		if err := permRows.Scan(&resource, &action, &scope); err != nil {
+			return nil, err
+		}
+		permStr := fmt.Sprintf("%s:%s:%s", resource, action, scope)
+		permissions = append(permissions, permStr)
+	}
+
+	// Get category scopes
+	categoryScopes, err := r.GetUserCategoryScopes(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if super admin
+	var isSuperAdmin bool
+	err = tx.QueryRow(ctx, "SELECT COALESCE(is_super_admin, false) FROM users WHERE id = $1", userID).Scan(&isSuperAdmin)
+	if err != nil {
+		return nil, err
+	}
+
+	return &EffectivePermissions{
+		UserID:         userID,
+		IsSuperAdmin:   isSuperAdmin,
+		Roles:          roles,
+		Permissions:    permissions,
+		CategoryScopes: categoryScopes,
+	}, nil
+}
+
+// ─── LEGACY: Maintain backward compatibility methods ─────────────────────────
+
+// HasRoleGrant checks if a user has a specific role grant (legacy)
+func (r *Repository) HasRoleGrant(ctx context.Context, tx pgx.Tx, userID int64, action string) (bool, error) {
+	// Try new system first
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM user_effective_permissions_cache
+			WHERE user_id = $1
+			AND action = $2
+			AND (expires_at IS NULL OR expires_at > NOW())
+		)
+	`
+	var exists bool
+	err := tx.QueryRow(ctx, query, userID, action).Scan(&exists)
+	if err == nil {
+		return exists, nil
+	}
+
+	// Fallback to old system
+	query = `
+		SELECT EXISTS (
+			SELECT 1 FROM user_roles ur
+			JOIN role_menu_actions rma ON rma.role_id = ur.role_id
+			JOIN menu_actions ma ON ma.id = rma.menu_action_id
+			WHERE ur.user_id = $1 AND ur.is_active = true AND ma.action = $2
+		)
+	`
+	err = tx.QueryRow(ctx, query, userID, action).Scan(&exists)
+	return exists, err
+}
+
+// FindActiveOverride finds an active override for a user (legacy)
+func (r *Repository) FindActiveOverride(ctx context.Context, tx pgx.Tx, userID int64, action string) (*ActiveOverride, error) {
+	query := `
+		SELECT upo.effect, upo.menu_action_id, COALESCE(upo.reason,''), upo.valid_until
+		FROM user_permission_overrides upo
+		WHERE upo.user_id = $1 AND upo.is_active = true
+		  AND (upo.valid_from IS NULL OR upo.valid_from <= NOW())
+		  AND (upo.valid_until IS NULL OR upo.valid_until > NOW())
+		LIMIT 1
+	`
+	var override ActiveOverride
+	err := tx.QueryRow(ctx, query, userID).Scan(&override.Effect, &override.MenuActionID, &override.Reason, &override.ValidUntil)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &override, nil
+}
+
+// FindABACPolicies finds ABAC policies for a user (legacy)
+func (r *Repository) FindABACPolicies(ctx context.Context, tx pgx.Tx, userID int64) ([]ABACPolicy, error) {
+	query := `
+		SELECT id, user_id, attribute, value, is_active
+		FROM abac_policies
+		WHERE user_id = $1 AND is_active = true
+	`
+	rows, err := tx.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var policies []ABACPolicy
+	for rows.Next() {
+		var p ABACPolicy
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Attribute, &p.Value, &p.IsActive); err != nil {
+			return nil, err
+		}
+		policies = append(policies, p)
+	}
+	return policies, nil
+}
+
+// InsertAuditLog inserts an audit log entry
+func (r *Repository) InsertAuditLog(ctx context.Context, tx pgx.Tx, entry AuditEntry) error {
+	query := `
+		INSERT INTO permission_audit_log (user_id, menu_action_id, permission_string, action_name, decision, reason, ip_address, user_agent, request_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`
+	
+	// Try to parse menu_action_id from action_name if it's numeric
+	var menuActionID *int
+	if entry.ActionName != "" {
+		var id int
+		if _, err := fmt.Sscanf(entry.ActionName, "%d", &id); err == nil {
+			menuActionID = &id
+		}
+	}
+	
+	_, err := tx.Exec(ctx, query,
+		entry.UserID, 
+		menuActionID, 
+		entry.ActionName, // Use action_name as permission_string for new system
+		entry.ActionName, 
+		entry.Decision,
+		entry.Reason, 
+		entry.IPAddress, 
+		entry.UserAgent, 
+		entry.RequestID,
+	)
+	return err
+}
+
+// ListAuditLogs lists audit log entries
+func (r *Repository) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset int) ([]AuditEntry, int64, error) {
+	// Get total count
+	var total int64
+	countQuery := `SELECT COUNT(*) FROM permission_audit_log`
+	err := tx.QueryRow(ctx, countQuery).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Get paginated logs
+	query := `
+		SELECT 
+			al.id, al.user_id, COALESCE(u.display_name, u.email, ''), COALESCE(u.email, ''),
+			al.action_name, al.decision, COALESCE(al.reason,''), 
+			COALESCE(al.ip_address::text, ''), COALESCE(al.user_agent, ''), 
+			COALESCE(al.request_id, ''), al.created_at
+		FROM permission_audit_log al
+		LEFT JOIN users u ON u.id = al.user_id
+		ORDER BY al.created_at DESC
+		LIMIT $1 OFFSET $2
+	`
+	rows, err := tx.Query(ctx, query, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var logs []AuditEntry
+	for rows.Next() {
+		var log AuditEntry
+		if err := rows.Scan(
+			&log.ID, &log.UserID, &log.UserName, &log.UserEmail,
+			&log.ActionName, &log.Decision, &log.Reason,
+			&log.IPAddress, &log.UserAgent, &log.RequestID, &log.CreatedAt,
+		); err != nil {
+			return nil, 0, err
+		}
+		logs = append(logs, log)
+	}
+
+	return logs, total, nil
+}
+
+// ListStaffWithRoles lists staff with their roles
+func (r *Repository) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search string) ([]StaffUserRoleSummary, error) {
+	query := `
+		SELECT 
+			u.id, COALESCE(u.display_name, u.email, ''), u.email,
+			ur.role_id, r.name, COALESCE(u.is_super_admin, false), COALESCE(u.is_active, true)
+		FROM users u
+		LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = true
+		LEFT JOIN roles r ON r.id = ur.role_id
+		WHERE u.is_staff = true
+		  AND ($1 = '' OR u.email ILIKE $2 OR u.display_name ILIKE $2)
+		ORDER BY u.email
+	`
+	searchPattern := "%" + search + "%"
+	rows, err := tx.Query(ctx, query, search, searchPattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var staff []StaffUserRoleSummary
+	for rows.Next() {
+		var s StaffUserRoleSummary
+		if err := rows.Scan(
+			&s.UserID, &s.DisplayName, &s.Email,
+			&s.RoleID, &s.RoleName, &s.IsSuperAdmin, &s.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		staff = append(staff, s)
+	}
+	return staff, nil
+}
+
+// ListStaffWithRolesDirect lists staff with their roles (direct pool access)
+func (r *Repository) ListStaffWithRolesDirect(ctx context.Context, search string) ([]StaffUserRoleSummary, error) {
+	query := `
+		SELECT 
+			u.id, COALESCE(u.display_name, u.email, ''), u.email,
+			ur.role_id, r.name, COALESCE(u.is_super_admin, false), COALESCE(u.is_active, true)
+		FROM users u
+		LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = true
+		LEFT JOIN roles r ON r.id = ur.role_id
+		WHERE u.is_staff = true
+		  AND ($1 = '' OR u.email ILIKE $2 OR u.display_name ILIKE $2)
+		ORDER BY u.email
+	`
+	searchPattern := "%" + search + "%"
+	rows, err := r.pool.Query(ctx, query, search, searchPattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var staff []StaffUserRoleSummary
+	for rows.Next() {
+		var s StaffUserRoleSummary
+		if err := rows.Scan(
+			&s.UserID, &s.DisplayName, &s.Email,
+			&s.RoleID, &s.RoleName, &s.IsSuperAdmin, &s.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		staff = append(staff, s)
+	}
+	return staff, nil
+}
+
+// CreateOverride creates a permission override (legacy)
+func (r *Repository) CreateOverride(ctx context.Context, tx pgx.Tx, userID int64, menuActionID int, effect, reason string, validFrom, validUntil *time.Time, grantedBy int64) error {
+	query := `
+		INSERT INTO user_permission_overrides (user_id, menu_action_id, effect, reason, valid_from, valid_until, granted_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (user_id, menu_action_id)
+		DO UPDATE SET 
+			effect = EXCLUDED.effect,
+			reason = EXCLUDED.reason,
+			valid_from = EXCLUDED.valid_from,
+			valid_until = EXCLUDED.valid_until,
+			granted_by = EXCLUDED.granted_by
+	`
+	_, err := tx.Exec(ctx, query, userID, menuActionID, effect, reason, validFrom, validUntil, grantedBy)
+	return err
+}
+
+// ─── Enhanced RBAC/ABAC Repository Methods ───────────────────────────
+
+// ListAllPermissions lists all permissions in the system
+func (r *Repository) ListAllPermissions(ctx context.Context, tx pgx.Tx) ([]Permission, error) {
+	query := `
+		SELECT id, resource, action, scope, description, is_system
+		FROM permissions
+		ORDER BY resource, action, scope
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var permissions []Permission
+	for rows.Next() {
+		var p Permission
+		if err := rows.Scan(
+			&p.ID, &p.Resource, &p.Action, &p.Scope, &p.Description, &p.IsSystem,
+		); err != nil {
+			return nil, err
+		}
+		permissions = append(permissions, p)
+	}
+	return permissions, nil
+}
+
+// RevokeRolePermissionsBulk revokes permissions from a role (bulk)
+func (r *Repository) RevokeRolePermissionsBulk(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, revokedBy int64) error {
+	query := `
+		DELETE FROM role_permissions
+		WHERE role_id = $1 AND permission_id = ANY($2)
+	`
+	_, err := tx.Exec(ctx, query, roleID, permissionIDs)
+	return err
+}
+
+// AssignDynamicPermissions assigns temporary dynamic permissions to a role
+func (r *Repository) AssignDynamicPermissions(ctx context.Context, tx pgx.Tx, roleID int, permissionIDs []int, assignedBy int64, expiresAt *time.Time, reason string) error {
+	query := `
+		INSERT INTO dynamic_permission_assignments (role_id, permission_id, assigned_by, expires_at, reason)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (role_id, permission_id) DO UPDATE SET
+			expires_at = EXCLUDED.expires_at,
+			reason = EXCLUDED.reason,
+			is_active = true
+	`
+	for _, permID := range permissionIDs {
+		_, err := tx.Exec(ctx, query, roleID, permID, assignedBy, expiresAt, reason)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetDynamicPermissions gets dynamic permissions for a role
+func (r *Repository) GetDynamicPermissions(ctx context.Context, tx pgx.Tx, roleID int) ([]DynamicPermissionAssignment, error) {
+	query := `
+		SELECT id, role_id, permission_id, assigned_by, assigned_at, expires_at, is_active, reason
+		FROM dynamic_permission_assignments
+		WHERE role_id = $1 AND is_active = true
+		ORDER BY assigned_at DESC
+	`
+	rows, err := tx.Query(ctx, query, roleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var assignments []DynamicPermissionAssignment
+	for rows.Next() {
+		var a DynamicPermissionAssignment
+		if err := rows.Scan(
+			&a.ID, &a.RoleID, &a.PermissionID, &a.AssignedBy, &a.AssignedAt, &a.ExpiresAt, &a.IsActive, &a.Reason,
+		); err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, a)
+	}
+	return assignments, nil
+}
+
+// RevokeDynamicPermission revokes a dynamic permission assignment
+func (r *Repository) RevokeDynamicPermission(ctx context.Context, tx pgx.Tx, assignmentID int, revokedBy int64) error {
+	query := `
+		UPDATE dynamic_permission_assignments
+		SET is_active = false
+		WHERE id = $1
+	`
+	_, err := tx.Exec(ctx, query, assignmentID)
+	return err
+}
+
+// ─── Approval Workflow Repository Methods ───────────────────────────
+
+// CreateApprovalRequest creates a new approval request
+func (r *Repository) CreateApprovalRequest(ctx context.Context, tx pgx.Tx, resourceType string, resourceID int64, requestedBy int64, comments string) (int, error) {
+	query := `
+		INSERT INTO approval_workflows (resource_type, resource_id, requested_by, comments)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`
+	var id int
+	err := tx.QueryRow(ctx, query, resourceType, resourceID, requestedBy, comments).Scan(&id)
+	return id, err
+}
+
+// ListApprovalRequests lists approval requests for a user
+func (r *Repository) ListApprovalRequests(ctx context.Context, tx pgx.Tx, userID int64) ([]ApprovalRequest, error) {
+	query := `
+		SELECT id, resource_type, resource_id, requested_by, requested_at, status, approved_by, approved_at, rejection_reason, comments
+		FROM approval_workflows
+		WHERE requested_by = $1
+		ORDER BY requested_at DESC
+	`
+	rows, err := tx.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var requests []ApprovalRequest
+	for rows.Next() {
+		var req ApprovalRequest
+		if err := rows.Scan(
+			&req.ID, &req.ResourceType, &req.ResourceID, &req.RequestedBy, &req.RequestedAt, &req.Status,
+			&req.ApprovedBy, &req.ApprovedAt, &req.RejectionReason, &req.Comments,
+		); err != nil {
+			return nil, err
+		}
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+// GetPendingApprovals gets pending approval requests for a user
+func (r *Repository) GetPendingApprovals(ctx context.Context, tx pgx.Tx, userID int64) ([]ApprovalRequest, error) {
+	query := `
+		SELECT aw.id, aw.resource_type, aw.resource_id, aw.requested_by, aw.requested_at, aw.status, aw.approved_by, aw.approved_at, aw.rejection_reason, aw.comments
+		FROM approval_workflows aw
+		JOIN approval_assignments aa ON aa.user_id = $1 AND aa.resource_type = aw.resource_type AND aa.can_approve = true AND aa.is_active = true
+		WHERE aw.status = 'pending'
+		ORDER BY aw.requested_at DESC
+	`
+	rows, err := tx.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var requests []ApprovalRequest
+	for rows.Next() {
+		var req ApprovalRequest
+		if err := rows.Scan(
+			&req.ID, &req.ResourceType, &req.ResourceID, &req.RequestedBy, &req.RequestedAt, &req.Status,
+			&req.ApprovedBy, &req.ApprovedAt, &req.RejectionReason, &req.Comments,
+		); err != nil {
+			return nil, err
+		}
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+// ApproveRequest approves an approval request
+func (r *Repository) ApproveRequest(ctx context.Context, tx pgx.Tx, requestID int, approvedBy int64, comments string) error {
+	query := `
+		UPDATE approval_workflows
+		SET status = 'approved', approved_by = $1, approved_at = NOW(), comments = COALESCE($2, comments)
+		WHERE id = $3 AND status = 'pending'
+	`
+	_, err := tx.Exec(ctx, query, approvedBy, comments, requestID)
+	return err
+}
+
+// RejectRequest rejects an approval request
+func (r *Repository) RejectRequest(ctx context.Context, tx pgx.Tx, requestID int, rejectedBy int64, reason string) error {
+	query := `
+		UPDATE approval_workflows
+		SET status = 'rejected', approved_by = $1, approved_at = NOW(), rejection_reason = $2
+		WHERE id = $3 AND status = 'pending'
+	`
+	_, err := tx.Exec(ctx, query, rejectedBy, reason, requestID)
+	return err
+}
+
+// ─── Approval Assignment Repository Methods ───────────────────────────
+
+// AssignApprovalRights assigns approval rights to a user
+func (r *Repository) AssignApprovalRights(ctx context.Context, tx pgx.Tx, userID int64, resourceType string, canApprove bool, assignedBy int64, expiresAt *time.Time) error {
+	query := `
+		INSERT INTO approval_assignments (user_id, resource_type, can_approve, assigned_by, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (user_id, resource_type) DO UPDATE SET
+			can_approve = EXCLUDED.can_approve,
+			expires_at = EXCLUDED.expires_at,
+			is_active = true
+	`
+	_, err := tx.Exec(ctx, query, userID, resourceType, canApprove, assignedBy, expiresAt)
+	return err
+}
+
+// GetApprovalAssignments gets all approval assignments
+func (r *Repository) GetApprovalAssignments(ctx context.Context, tx pgx.Tx) ([]ApprovalAssignment, error) {
+	query := `
+		SELECT id, user_id, resource_type, can_approve, assigned_by, assigned_at, expires_at, is_active
+		FROM approval_assignments
+		WHERE is_active = true
+		ORDER BY assigned_at DESC
+	`
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var assignments []ApprovalAssignment
+	for rows.Next() {
+		var a ApprovalAssignment
+		if err := rows.Scan(
+			&a.ID, &a.UserID, &a.ResourceType, &a.CanApprove, &a.AssignedBy, &a.AssignedAt, &a.ExpiresAt, &a.IsActive,
+		); err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, a)
+	}
+	return assignments, nil
+}
+
+// RevokeApprovalRights revokes approval rights
+func (r *Repository) RevokeApprovalRights(ctx context.Context, tx pgx.Tx, assignmentID int, revokedBy int64) error {
+	query := `
+		UPDATE approval_assignments
+		SET is_active = false
+		WHERE id = $1
+	`
+	_, err := tx.Exec(ctx, query, assignmentID)
+	return err
+}
+
+// CreateABACPolicy creates an ABAC policy (legacy)
+func (r *Repository) CreateABACPolicy(ctx context.Context, tx pgx.Tx, userID int64, attribute string, value json.RawMessage) error {
+	query := `
+		INSERT INTO abac_policies (user_id, attribute, value)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (user_id, attribute)
+		DO UPDATE SET value = EXCLUDED.value
+	`
+	_, err := tx.Exec(ctx, query, userID, attribute, value)
+	return err
 }
 
 func (r *Repository) AssignUserDistrictScopes(ctx context.Context, tx pgx.Tx, userID int64, districtIDs []int) error {
@@ -771,270 +1806,4 @@ func (r *Repository) GetUserEffectivePermissions(ctx context.Context, tx pgx.Tx,
 		Permissions:    permsList,
 		CategoryScopes: catScopes,
 	}, nil
-}
-
-// ─── Policy & Evaluation Queries ───────────────
-
-func (r *Repository) HasRoleGrant(ctx context.Context, tx pgx.Tx, userID int64, actionName string) (bool, error) {
-	query := `
-		SELECT EXISTS(
-			SELECT 1
-			FROM user_roles ur
-			JOIN role_menu_actions rma ON rma.role_id = ur.role_id
-			JOIN menu_actions ma ON ma.id = rma.menu_action_id
-			JOIN menus m ON m.id = ma.menu_id
-			WHERE ur.user_id = $1
-			  AND ur.is_active = TRUE
-			AND UPPER(m.name || '.' || ma.action) = UPPER($2)
-		)
-	`
-	var hasGrant bool
-	err := tx.QueryRow(ctx, query, userID, actionName).Scan(&hasGrant)
-	return hasGrant, err
-}
-
-func (r *Repository) FindActiveOverride(ctx context.Context, tx pgx.Tx, userID int64, actionName string) (*ActiveOverride, error) {
-	query := `
-		SELECT upo.effect, upo.menu_action_id, upo.reason, upo.valid_until
-		FROM user_permission_overrides upo
-		JOIN menu_actions ma ON ma.id = upo.menu_action_id
-		JOIN menus m ON m.id = ma.menu_id
-		WHERE upo.user_id = $1
-		  AND UPPER(m.name || '.' || ma.action) = UPPER($2)
-		  AND upo.is_active = TRUE
-		  AND (upo.valid_from IS NULL OR upo.valid_from <= NOW())
-		  AND (upo.valid_until IS NULL OR upo.valid_until > NOW())
-		ORDER BY upo.created_at DESC
-		LIMIT 1
-	`
-	var ov ActiveOverride
-	err := tx.QueryRow(ctx, query, userID, actionName).Scan(
-		&ov.Effect, &ov.MenuActionID, &ov.Reason, &ov.ValidUntil,
-	)
-	if err == pgx.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &ov, nil
-}
-
-func (r *Repository) CreateOverride(ctx context.Context, tx pgx.Tx, userID int64, menuActionID int, effect, reason string, validFrom, validUntil *time.Time, grantedBy int64) error {
-	query := `
-		INSERT INTO user_permission_overrides
-			(user_id, menu_action_id, effect, reason, valid_from, valid_until, granted_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
-	_, err := tx.Exec(ctx, query, userID, menuActionID, effect, reason, validFrom, validUntil, grantedBy)
-	return err
-}
-
-func (r *Repository) FindABACPolicies(ctx context.Context, tx pgx.Tx, userID int64) ([]ABACPolicy, error) {
-	query := `
-		SELECT id, user_id, attribute, value, is_active
-		FROM abac_policies
-		WHERE user_id = $1 AND is_active = TRUE
-	`
-	rows, err := tx.Query(ctx, query, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var policies []ABACPolicy
-	for rows.Next() {
-		var p ABACPolicy
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Attribute, &p.Value, &p.IsActive); err != nil {
-			return nil, err
-		}
-		policies = append(policies, p)
-	}
-	return policies, rows.Err()
-}
-
-func (r *Repository) CreateABACPolicy(ctx context.Context, tx pgx.Tx, userID int64, attribute string, value json.RawMessage) error {
-	query := `
-		INSERT INTO abac_policies (user_id, attribute, value)
-		VALUES ($1, $2, $3)
-	`
-	_, err := tx.Exec(ctx, query, userID, attribute, value)
-	return err
-}
-
-// ─── Audit Log Queries ─────────────────────────
-
-func (r *Repository) InsertAuditLog(ctx context.Context, tx pgx.Tx, log AuditEntry) error {
-	query := `
-		INSERT INTO permission_audit_log
-			(user_id, action_name, decision, reason, ip_address, user_agent, request_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
-	_, err := tx.Exec(ctx, query,
-		log.UserID, log.ActionName, log.Decision,
-		log.Reason, log.IPAddress, log.UserAgent, log.RequestID,
-	)
-	return err
-}
-
-func (r *Repository) ListAuditLogs(ctx context.Context, tx pgx.Tx, limit, offset int) ([]AuditEntry, int64, error) {
-	var total int64
-	var countErr error
-	if tx != nil {
-		countErr = tx.QueryRow(ctx, "SELECT COUNT(*) FROM permission_audit_log").Scan(&total)
-	} else {
-		countErr = r.pool.QueryRow(ctx, "SELECT COUNT(*) FROM permission_audit_log").Scan(&total)
-	}
-	if countErr != nil {
-		total = 0
-	}
-
-	query := `
-		SELECT pal.id, pal.user_id, COALESCE(u.display_name, 'System Staff'), COALESCE(u.email, ''),
-		       pal.action_name, pal.decision, COALESCE(pal.reason, ''),
-		       COALESCE(host(pal.ip_address), ''), COALESCE(pal.user_agent, ''), COALESCE(pal.request_id, ''), pal.created_at
-		FROM permission_audit_log pal
-		LEFT JOIN users u ON u.id = pal.user_id
-		ORDER BY pal.created_at DESC
-		LIMIT $1 OFFSET $2
-	`
-	var rows pgx.Rows
-	var err error
-	if tx != nil {
-		rows, err = tx.Query(ctx, query, limit, offset)
-	} else {
-		rows, err = r.pool.Query(ctx, query, limit, offset)
-	}
-	if err != nil {
-		return []AuditEntry{}, 0, nil
-	}
-	defer rows.Close()
-
-	logs := []AuditEntry{}
-	for rows.Next() {
-		var l AuditEntry
-		if err := rows.Scan(
-			&l.ID, &l.UserID, &l.UserName, &l.UserEmail, &l.ActionName, &l.Decision, &l.Reason,
-			&l.IPAddress, &l.UserAgent, &l.RequestID, &l.CreatedAt,
-		); err != nil {
-			return nil, 0, err
-		}
-		logs = append(logs, l)
-	}
-
-	return logs, total, rows.Err()
-}
-
-// ─── Staff Roles & Scoping Summary ─────────────
-
-func (r *Repository) ListStaffWithRoles(ctx context.Context, tx pgx.Tx, search string) ([]StaffUserRoleSummary, error) {
-	query := `
-		SELECT DISTINCT ON (u.id) u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
-		       u.is_super_admin, u.is_active,
-		       r.id, r.name
-		FROM users u
-		LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = TRUE
-		LEFT JOIN roles r ON r.id = ur.role_id
-		WHERE u.is_staff = TRUE OR u.is_super_admin = TRUE
-	`
-	var rows pgx.Rows
-	var err error
-	if strings.TrimSpace(search) != "" {
-		query += ` AND (u.display_name ILIKE $1 OR u.email ILIKE $1)
-		           ORDER BY u.id ASC, u.is_super_admin DESC`
-		rows, err = tx.Query(ctx, query, "%"+strings.TrimSpace(search)+"%")
-	} else {
-		query += ` ORDER BY u.id ASC, u.is_super_admin DESC`
-		rows, err = tx.Query(ctx, query)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var list []StaffUserRoleSummary
-	for rows.Next() {
-		var s StaffUserRoleSummary
-		var roleID *int
-		var roleName *string
-		if err := rows.Scan(&s.UserID, &s.DisplayName, &s.Email, &s.IsSuperAdmin, &s.IsActive, &roleID, &roleName); err != nil {
-			return nil, err
-		}
-		s.RoleID = roleID
-		s.RoleName = roleName
-		list = append(list, s)
-	}
-
-	for i := range list {
-		scopes, _ := r.GetUserCategoryScopes(ctx, tx, list[i].UserID)
-		if scopes == nil {
-			scopes = []CategoryScope{}
-		}
-		list[i].CategoryScopes = scopes
-	}
-
-	return list, nil
-}
-
-func (r *Repository) ListStaffWithRolesDirect(ctx context.Context, search string) ([]StaffUserRoleSummary, error) {
-	query := `
-		SELECT DISTINCT ON (u.id) u.id, COALESCE(u.display_name, 'Staff Member'), COALESCE(u.email, ''),
-		       u.is_super_admin, u.is_active,
-		       r.id, r.name
-		FROM users u
-		LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = TRUE
-		LEFT JOIN roles r ON r.id = ur.role_id
-		WHERE u.is_staff = TRUE OR u.is_super_admin = TRUE
-	`
-	var rows pgx.Rows
-	var err error
-	if strings.TrimSpace(search) != "" {
-		query += ` AND (u.display_name ILIKE $1 OR u.email ILIKE $1)
-		           ORDER BY u.id ASC, u.is_super_admin DESC`
-		rows, err = r.pool.Query(ctx, query, "%"+strings.TrimSpace(search)+"%")
-	} else {
-		query += ` ORDER BY u.id ASC, u.is_super_admin DESC`
-		rows, err = r.pool.Query(ctx, query)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var list []StaffUserRoleSummary
-	for rows.Next() {
-		var s StaffUserRoleSummary
-		var roleID *int
-		var roleName *string
-		if err := rows.Scan(&s.UserID, &s.DisplayName, &s.Email, &s.IsSuperAdmin, &s.IsActive, &roleID, &roleName); err != nil {
-			return nil, err
-		}
-		s.RoleID = roleID
-		s.RoleName = roleName
-		list = append(list, s)
-	}
-
-	for i := range list {
-		catQuery := `
-			SELECT c.id, c.name, c.slug, COALESCE(c.path, c.name), c.level
-			FROM categories c
-			JOIN user_category_scopes ucs ON ucs.category_id = c.id
-			WHERE ucs.user_id = $1
-			ORDER BY c.level ASC, c.name ASC
-		`
-		cRows, err := r.pool.Query(ctx, catQuery, list[i].UserID)
-		var scopes []CategoryScope
-		if err == nil {
-			for cRows.Next() {
-				var cs CategoryScope
-				if err := cRows.Scan(&cs.CategoryID, &cs.Name, &cs.Slug, &cs.Path, &cs.Level); err == nil {
-					scopes = append(scopes, cs)
-				}
-			}
-			cRows.Close()
-		}
-		list[i].CategoryScopes = scopes
-	}
-
-	return list, nil
 }

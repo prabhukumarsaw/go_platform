@@ -21,12 +21,19 @@ func NewService(pool *pgxpool.Pool, logger zerolog.Logger) *Service {
 	}
 }
 
-func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx) (*AnalyticsOverview, error) {
+func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx, authorID *int64) (*AnalyticsOverview, error) {
 	var overview AnalyticsOverview
 
-	// Aggregate counts
-	_ = tx.QueryRow(ctx, "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COUNT(*) FILTER (WHERE status='draft'), COUNT(*) FILTER (WHERE status IN ('review', 'approved')), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles").
-		Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalDrafts, &overview.TotalReview, &overview.TotalViews, &overview.TotalBreaking)
+	// Aggregate counts with optional author filtering
+	countQuery := "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='published'), COUNT(*) FILTER (WHERE status='draft'), COUNT(*) FILTER (WHERE status IN ('review', 'approved')), COALESCE(SUM(view_count), 0), COUNT(*) FILTER (WHERE is_breaking=TRUE) FROM articles"
+	if authorID != nil {
+		countQuery += " WHERE author_id = $1"
+		_ = tx.QueryRow(ctx, countQuery, *authorID).
+			Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalDrafts, &overview.TotalReview, &overview.TotalViews, &overview.TotalBreaking)
+	} else {
+		_ = tx.QueryRow(ctx, countQuery).
+			Scan(&overview.TotalArticles, &overview.TotalPublished, &overview.TotalDrafts, &overview.TotalReview, &overview.TotalViews, &overview.TotalBreaking)
+	}
 
 	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM newsletter_subscriptions WHERE is_active = TRUE").Scan(&overview.TotalSubscribers)
 
@@ -37,11 +44,22 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx) (*AnalyticsOvervie
 		LEFT JOIN article_categories ac ON ac.category_id = c.id
 		LEFT JOIN articles a ON a.id = ac.article_id AND a.status = 'published'
 		WHERE c.level = 1 OR c.parent_id IS NULL
+	`
+	if authorID != nil {
+		stateQuery += " AND (a.author_id = $1 OR a.author_id IS NULL)"
+	}
+	stateQuery += `
 		GROUP BY c.id, c.name
 		ORDER BY views DESC
 		LIMIT 10
 	`
-	rows, err := tx.Query(ctx, stateQuery)
+	var rows pgx.Rows
+	var err error
+	if authorID != nil {
+		rows, err = tx.Query(ctx, stateQuery, *authorID)
+	} else {
+		rows, err = tx.Query(ctx, stateQuery)
+	}
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -57,16 +75,29 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx) (*AnalyticsOvervie
 		SELECT c.name, COUNT(ac.article_id) as count
 		FROM categories c
 		LEFT JOIN article_categories ac ON ac.category_id = c.id
+		LEFT JOIN articles a ON a.id = ac.article_id
+		WHERE 1=1
+	`
+	if authorID != nil {
+		catQuery += " AND (a.author_id = $1 OR a.author_id IS NULL)"
+	}
+	catQuery += `
 		GROUP BY c.name
 		ORDER BY count DESC
 		LIMIT 8
 	`
-	cRows, err := tx.Query(ctx, catQuery)
-	if err == nil {
+	var cRows pgx.Rows
+	var cErr error
+	if authorID != nil {
+		cRows, cErr = tx.Query(ctx, catQuery, *authorID)
+	} else {
+		cRows, cErr = tx.Query(ctx, catQuery)
+	}
+	if cErr == nil {
 		defer cRows.Close()
 		for cRows.Next() {
 			var cr CategoryReadership
-			if err := cRows.Scan(&cr.CategoryName, &cr.Count); err == nil {
+			if cErr := cRows.Scan(&cr.CategoryName, &cr.Count); cErr == nil {
 				overview.CategoryBreakdown = append(overview.CategoryBreakdown, cr)
 			}
 		}
@@ -77,15 +108,26 @@ func (s *Service) GetOverview(ctx context.Context, tx pgx.Tx) (*AnalyticsOvervie
 		SELECT id, title, slug, view_count, language
 		FROM articles
 		WHERE status = 'published'
+	`
+	if authorID != nil {
+		trendQuery += " AND author_id = $1"
+	}
+	trendQuery += `
 		ORDER BY view_count DESC, published_at DESC
 		LIMIT 5
 	`
-	tRows, err := tx.Query(ctx, trendQuery)
-	if err == nil {
+	var tRows pgx.Rows
+	var tErr error
+	if authorID != nil {
+		tRows, tErr = tx.Query(ctx, trendQuery, *authorID)
+	} else {
+		tRows, tErr = tx.Query(ctx, trendQuery)
+	}
+	if tErr == nil {
 		defer tRows.Close()
 		for tRows.Next() {
 			var ts TrendingStat
-			if err := tRows.Scan(&ts.ID, &ts.Title, &ts.Slug, &ts.ViewCount, &ts.Language); err == nil {
+			if tErr := tRows.Scan(&ts.ID, &ts.Title, &ts.Slug, &ts.ViewCount, &ts.Language); tErr == nil {
 				overview.TopTrendingArticles = append(overview.TopTrendingArticles, ts)
 			}
 		}

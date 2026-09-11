@@ -296,7 +296,7 @@ func (s *Service) UploadAvatar(ctx context.Context, userID int64, filename strin
 // ─── List / Search / Filter ─────────────────────
 
 // ListMedia returns media files filtered by category, folder, mimeType, and search query.
-func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, folder string, mimeType string, search string, page, perPage int) ([]Media, int64, error) {
+func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, folder string, mimeType string, search string, page, perPage int, uploaderID *int64) ([]Media, int64, error) {
 	s.ensureSchema(ctx)
 
 	if page < 1 {
@@ -331,6 +331,13 @@ func (s *Service) ListMedia(ctx context.Context, tx pgx.Tx, category string, fol
 	if search != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("(original_name ILIKE $%d OR alt_text ILIKE $%d OR caption ILIKE $%d)", argIdx, argIdx, argIdx))
 		args = append(args, "%"+search+"%")
+		argIdx++
+	}
+
+	// Filter by uploader ID for ownership-based access
+	if uploaderID != nil {
+		whereClauses = append(whereClauses, fmt.Sprintf("uploader_id = $%d", argIdx))
+		args = append(args, *uploaderID)
 		argIdx++
 	}
 

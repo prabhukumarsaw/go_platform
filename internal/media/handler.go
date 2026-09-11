@@ -71,6 +71,7 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 // List returns media files with filtering by category, folder, mimeType, and search.
 func (h *Handler) List(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
 
 	category := c.Query("category")
 	folder := c.Query("folder")
@@ -79,7 +80,25 @@ func (h *Handler) List(c *fiber.Ctx) error {
 	page := c.QueryInt("page", 1)
 	perPage := c.QueryInt("per_page", 20)
 
-	items, total, err := h.service.ListMedia(c.Context(), tx, category, folder, mimeType, search, page, perPage)
+	// Apply ownership-based filtering based on user's permission scope
+	var uploaderID *int64
+	if sess != nil && !sess.IsSuperAdmin {
+		// Check if user has 'own' scope for media:read
+		// If so, only show their own media
+		// This is a simplified check - in production, use the full IAM service
+		hasRestrictedRole := false
+		for _, role := range sess.Roles {
+			if role == "reporter" || role == "correspondent" {
+				hasRestrictedRole = true
+				break
+			}
+		}
+		if hasRestrictedRole {
+			uploaderID = &sess.UserID
+		}
+	}
+
+	items, total, err := h.service.ListMedia(c.Context(), tx, category, folder, mimeType, search, page, perPage, uploaderID)
 	if err != nil {
 		return response.InternalError(c, "Failed to list media: "+err.Error())
 	}

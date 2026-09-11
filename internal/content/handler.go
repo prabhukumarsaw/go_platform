@@ -437,6 +437,7 @@ func (h *Handler) GetPersonalizedFeed(c *fiber.Ctx) error {
 // StudioListArticles returns all articles across workflow statuses (for Kanban).
 func (h *Handler) StudioListArticles(c *fiber.Ctx) error {
 	tx := c.Locals("tx").(pgx.Tx)
+	sess := middleware.SessionFromCtx(c)
 
 	status := c.Query("status")
 	if status == "all" {
@@ -455,6 +456,23 @@ func (h *Handler) StudioListArticles(c *fiber.Ctx) error {
 		Category: c.Query("category"),
 		Page:     c.QueryInt("page", 1),
 		PerPage:  c.QueryInt("per_page", 50),
+	}
+
+	// Apply ownership-based filtering based on user's enhanced permission scope
+	if sess != nil && !sess.IsSuperAdmin {
+		// Check if user has 'read_own' permission instead of 'read_all'
+		// This is a simplified check for enhanced permissions
+		// In production, this should use the full IAM service
+		hasRestrictedRole := false
+		for _, role := range sess.Roles {
+			if role == "reporter" || role == "correspondent" {
+				hasRestrictedRole = true
+				break
+			}
+		}
+		if hasRestrictedRole {
+			filter.AuthorID = &sess.UserID
+		}
 	}
 
 	articles, total, err := h.service.ListArticles(c.Context(), tx, filter)

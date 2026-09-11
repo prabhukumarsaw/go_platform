@@ -348,6 +348,8 @@ func main() {
 
 	// ─── 5. Domain Services Dependency Injection 
 	iamService := iam.NewService(pool, log)
+	iamEnhancedService := iam.NewEnhancedServiceWrapper(pool, log)
+	iamMigrationService := iam.NewMigrationService(pool, log)
 	authService := auth.NewService(pool, *cfg, log)
 	contentService := content.NewService(pool, redisClient, log)
 	if err := contentService.EnsureHomepageSchema(ctx); err != nil {
@@ -372,7 +374,7 @@ func main() {
 	// ─── 6. Domain Handlers Registry ────────────
 	handlers := &routes.HandlerRegistry{
 		Auth:          auth.NewHandler(authService),
-		IAM:           iam.NewHandler(iamService),
+		IAM:           iam.NewHandler(iamService, iamEnhancedService),
 		Content:       content.NewHandler(contentService),
 		Media:         media.NewHandler(mediaService),
 		Ads:           ads.NewHandler(adsService),
@@ -388,6 +390,9 @@ func main() {
 		AI:            ai.NewHandler(aiService),
 		Settings:      settings.NewHandler(pool, cfg.Media.UploadDir),
 	}
+
+	// ─── 6.5. Migration Handler Registry ─────────
+	migrationHandler := iam.NewMigrationHandler(iamMigrationService)
 
 	// ─── 7. Fiber Web Engine with Global Error Handler 
 	app := fiber.New(fiber.Config{
@@ -429,6 +434,9 @@ func main() {
 
 	// ─── 9. Mount Centralized Router ────────────
 	routes.Setup(app, handlers, pool, cfg)
+
+	// ─── 9.5. Mount Migration Routes ────────────
+	migrationHandler.RegisterMigrationRoutes(app)
 
 	// ─── 10. Start Server ───────────────────────
 	go func() {
